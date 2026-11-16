@@ -23,6 +23,7 @@ import bisect
 import codecs
 import datetime
 import difflib
+import functools
 import hashlib
 import hmac
 import html
@@ -61,9 +62,9 @@ from PyQt6.QtGui import (QAction, QGuiApplication, QBrush, QColor, QImage, QLine
                          QPainter, QPainterPath, QPalette, QPen, QPixmap, QShortcut, QSyntaxHighlighter, QTextCharFormat, QTextCursor, QTextFormat)
 from PyQt6.QtWidgets import (
     QAbstractButton, QGraphicsOpacityEffect, QAbstractItemView, QAbstractScrollArea, QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QSizePolicy,
+    QSizePolicy, QScrollBar, QSlider, QStyleOptionSlider,
     QFileDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit,
-    QButtonGroup, QListWidget, QSpinBox, QTextEdit, QListWidgetItem, QPlainTextEdit, QStackedWidget, QTextBrowser,
+    QButtonGroup, QListView, QListWidget, QSpinBox, QTextEdit, QListWidgetItem, QPlainTextEdit, QStackedWidget, QTextBrowser,
     QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSplitter, QSplitterHandle, QStyle,
     QStyledItemDelegate, QStyleOptionViewItem, QTableWidget, QTableWidgetItem, QToolButton, QToolTip,
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
@@ -76,8 +77,8 @@ NEXUS_APP_NAME = "w3-linux-mod-manager"    # how the app names itself to Nexus (
 APP_VERSION = "0.6b"
 # Nexus login (OAuth 2.0 with PKCE). Paste the app's client ID from Nexus support between the quotes.
 # With it, Settings has a "Log in with Nexus" button, and update checks and Nexus downloads work.
-# Left empty, the app doesn't talk to Nexus at all (Nexus doesn't allow personal API keys in a
-# public app), and a key saved in the settings file earlier is kept there, unused.
+# Left empty, the app talks to Nexus only in a testing build (NEXUS_TESTING below), with a
+# personal API key.
 NEXUS_CLIENT_ID = ""
 # The port on this PC the login's answer comes back to: http://127.0.0.1:<port>/callback is the
 # callback URI registered with Nexus, so it must stay the same (see NEXUS_OAUTH_REDIRECT).
@@ -97,25 +98,25 @@ def _user_agent():
 
 
 USER_AGENT = _user_agent()
-# The developer's own personal API key, as a SHA-256 fingerprint (never the key itself: this file
-# is public). Only for his own testing while the Nexus login above isn't set up yet: a key in his
-# settings file with exactly this fingerprint keeps the old API key field and everything online
-# working. Any other key does nothing, and the app never asks anyone for a personal key. Once
-# NEXUS_CLIENT_ID is filled in this does nothing either: a saved key is cleared at start, and
-# only the OAuth login is used.
-DEV_KEY_SHA256 = "f8ba3249061f1ef8b7e49504080a9873efb0d2703f8afffb6c661a6deb1926a9"
+# A testing build: while NEXUS_CLIENT_ID is empty, Settings takes a personal API key (from the
+# API Keys page of a Nexus account), and update checks and Nexus downloads work with it. Nexus
+# allows personal keys only for testing and personal use, not in a public app, so a public
+# release before the client ID arrives needs this set to False: then the app doesn't talk to
+# Nexus at all, and a key saved earlier stays in the settings file, unused. Once NEXUS_CLIENT_ID
+# is filled in this does nothing: a saved key is cleared at start, and only the login is used.
+NEXUS_TESTING = True
 
 
-def _dev_key(key):
-    return bool(key) and hashlib.sha256(str(key).strip().encode()).hexdigest() == DEV_KEY_SHA256
+def _test_key(key):
+    return NEXUS_TESTING and bool(str(key or "").strip())
 
 
 def nexus_on(cfg=None):
-    """Does the app talk to Nexus? With the login set up, yes; before that, only with the
-    developer's own key (see DEV_KEY_SHA256)."""
+    """Does the app talk to Nexus? With the login set up, yes; before that, only in a testing
+    build with a personal API key (see NEXUS_TESTING)."""
     if NEXUS_CLIENT_ID:
         return True
-    return _dev_key((cfg or {}).get("nexus_key") or _HELD.get("nexus_key"))
+    return _test_key((cfg or {}).get("nexus_key") or _HELD.get("nexus_key"))
 MANAGER_DIRNAME = "_ModManager"
 VENV_NAME = "w3modmanager_venv"       # the launcher's private Python setup, when the system has no PyQt6
 COMPILED_NAME = "w3modmanager.compiled"  # the launcher's ready-to-run copy of the app (see the launcher)
@@ -210,7 +211,7 @@ def load_config():
     if not cfg.get("game_dir") and HOME_GAME is not None and is_game_dir(HOME_GAME):
         cfg["game_dir"] = str(HOME_GAME)          # the app sits in the game's _ModManager: that game
     cfg.pop("nexus_oauth", None)                  # the login's tokens: only ever through oauth_tokens()
-    if not NEXUS_CLIENT_ID and not _dev_key(cfg.get("nexus_key")):
+    if not NEXUS_CLIENT_ID and not _test_key(cfg.get("nexus_key")):
         # no Nexus login yet: nothing goes to Nexus, so no key is handed out. One saved earlier
         # stays in the file for when the login is there.
         _HELD.update({k: cfg.pop(k) for k in ("nexus_key",) if k in cfg})
@@ -229,6 +230,8 @@ def save_config(cfg):
             and APP_DIR.name.lower() != MANAGER_DIRNAME.lower():
         cfg = _adopt_home(home, cfg)
     if not NEXUS_CLIENT_ID:
+        if _test_key(cfg.get("nexus_key")):
+            _HELD.clear()                          # a personal key just pasted in a testing build
         cfg = {**{k: v for k, v in cfg.items() if k not in _HELD}, **_HELD}
     cfg = {k: v for k, v in cfg.items() if k != "nexus_oauth"}
     tokens = oauth_tokens()                       # this process's own copy, never an older one
@@ -601,7 +604,13 @@ def file_family(filename):
     if hit is None:                       # the same names are asked about on every redraw
         if len(_FAMILY) > 50000:
             _FAMILY.clear()
-        hit = _FAMILY[key] = re.sub(r"[^a-z0-9]+", "", parse_archive_name(Path(filename).name)[0].lower())
+        name, version, _nid = parse_archive_name(Path(filename).name)
+        # the file's own version in its name too ("NightSky 2.0.3", "NightSky 2.0.4"): left out,
+        # so each upload is the same file. Only that version, as a word of its own: "DX12", "4K" or
+        # a game version in brackets ("Main files (5.0)" at 1.1.0) stay part of the name
+        if version and version[:1].isdigit():
+            name = re.sub(r"(?<![0-9A-Za-z.])[vV]?" + re.escape(version) + r"(?![0-9A-Za-z.])", " ", name)
+        hit = _FAMILY[key] = re.sub(r"[^a-z0-9]+", "", name.lower())
     return hit
 
 
@@ -979,6 +988,27 @@ def parse_snippets(text, name=""):
 
 
 DOC_EXTS = {".txt", ".md", ".nfo", ".rtf", ".html", ".htm", ".pdf"}   # readmes kept with a mod
+SETTINGS_FILES = {"input.settings", "user.settings", "dx12user.settings", "dx11user.settings"}
+PICTURE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+PRESET_KEEP = "keybind-preset.input-settings"  # a keybind preset's file, kept with its readmes (a name the readme reader skips)
+
+
+def settings_only(root):
+    """{file name (lower): its path in the archive} when an unpacked archive holds nothing but the
+    game's settings files (input.settings, user.settings…), besides readmes and pictures: a preset,
+    nothing to put in the game folder. None otherwise."""
+    found, other = {}, False
+    for dp, _dn, files in os.walk(root):
+        for f in files:
+            path = Path(dp, f)
+            ext = path.suffix.lower()
+            if path.is_symlink() or ext in DOC_EXTS or ext in PICTURE_EXTS or ext == ".url":
+                continue
+            if f.lower() in SETTINGS_FILES:
+                found.setdefault(f.lower(), path.relative_to(root).as_posix())
+            else:
+                other = True
+    return found if found and not other else None
 # Windows scripts some mods ship to add their keys (a .bat that edits input.settings): never put in
 # the game, kept with the readmes so you can read them, and read for the keys they add
 SCRIPT_EXTS = {".bat", ".cmd", ".ps1"}
@@ -1262,6 +1292,8 @@ def nexus_login_needed():
     """(title, what to do) when there's no key, in the words of the login Settings offers."""
     if NEXUS_CLIENT_ID:
         return "Nexus login needed", "Log in to Nexus in Settings."
+    if NEXUS_TESTING:
+        return "Nexus API key needed", "Paste your personal API key in Settings."
     return "Nexus is off", "This version doesn't connect to Nexus yet."
 
 
@@ -2309,6 +2341,21 @@ def bundle_entries(path):
     return frozenset(e[0] for e in bundle_toc(path))
 
 
+def folder_packed_sigs(folder):
+    """{packed file (lower case): (size, CRC32)} for every file a mod folder's bundles hold, from
+    their tables: two folders packing the very same file isn't a clash, whichever is used. None
+    for a file it can't vouch for (no CRC32 stored, or two different copies in its own bundles)."""
+    out = {}
+    content = ci_child(folder, "content") if folder else None
+    for dp, _dn, files in os.walk(content) if content and content.is_dir() else ():
+        for f in files:
+            if f.lower().endswith(".bundle"):
+                for name, usize, _z, _off, crc, _comp in bundle_toc(Path(dp, f)):
+                    sig = (usize, crc) if crc else None
+                    out[name] = sig if out.get(name, sig) == sig else None
+    return out
+
+
 # --- unpacking one file from a bundle (pure Python: nothing to install) -------------
 # The game packs with zlib, LZ4, snappy or doboz; mods' tools use LZ4 (hc). All four are
 # checked against every XML file in a real install (sizes and CRC32).
@@ -2489,14 +2536,18 @@ def bundle_peek(path, entry, n=16):
             f.seek(doff)
             raw = f.read(min(zsize, n + 64))
         if raw:
-            lit, i = raw[0] >> 4, 1
+            lit, i, done = raw[0] >> 4, 1, True
             if lit == 15:
+                done = False
                 while i < len(raw):
                     lit += raw[i]
                     i += 1
                     if raw[i - 1] != 255:
+                        done = True
                         break
-            if lit >= min(n, usize):
+            # (a long run's length takes a byte per 255: when they don't all fit in what was
+            # read, the whole file is unpacked instead of guessing where its bytes start)
+            if done and lit >= min(n, usize) and len(raw) - i >= min(n, usize):
                 return bytes(raw[i:i + min(n, usize)])
     return bundle_read(path, entry)[:n]
 
@@ -2525,18 +2576,24 @@ def _bundle_unpack(path, entry):
     with open(path, "rb") as f:
         f.seek(doff)
         raw = f.read(zsize)
-    if comp == 0:
-        data = bytes(raw[:usize])
-    elif comp == 1:
-        data = zlib.decompress(raw)
-    elif comp == 2:
-        data = _snappy_raw(raw, usize)
-    elif comp == 3:
-        data = _doboz(raw, usize)
-    elif comp in (4, 5):
-        data = _lz4_block(raw, usize)
-    else:
-        raise ValueError(f"unknown packing ({comp})")
+    if len(raw) != zsize:
+        raise ValueError("the bundle ends before this file does")
+    try:
+        if comp == 0:
+            data = bytes(raw[:usize])
+        elif comp == 1:
+            data = zlib.decompress(raw)
+        elif comp == 2:
+            data = _snappy_raw(raw, usize)
+        elif comp == 3:
+            data = _doboz(raw, usize)
+        elif comp in (4, 5):
+            data = _lz4_block(raw, usize)
+        else:
+            raise ValueError(f"unknown packing ({comp})")
+    except (IndexError, zlib.error, struct.error, OverflowError) as e:
+        # damaged or cut-off data: said the way every caller expects, never a crash
+        raise ValueError(f"damaged packed data ({type(e).__name__})") from None
     if len(data) != usize or (crc and zlib.crc32(data) != crc):
         raise ValueError("it doesn't unpack to what the bundle says")
     return data
@@ -3283,6 +3340,79 @@ def _w3s_count(data, pos):
     return value, pos
 
 
+def _w3s_unit(data, pos, n3, unit):
+    """How wide a .w3strings file's text is, by what fills it to its end: 2 bytes a character
+    (4.x), 1 (5.00), the version's own first when both would fit; None when neither does."""
+    for u in dict.fromkeys((unit, 1, 2)):
+        if pos + u * n3 + 2 == len(data):
+            return u
+    return None
+
+
+def _w3s_text(data, pos, unit, magic, offset, length):
+    """One string of a .w3strings file, decoded (see w3strings_read), or None."""
+    at = pos + unit * offset
+    if length > 1 << 16 or at + unit * length > len(data) - 2:
+        return None
+    # each character's key: (length + 1) times a 16-bit value that turns one bit left per
+    # character, so the keys repeat every 16 characters: one pattern, XORed in one go
+    string_key = (magic >> 8) & 0xFFFF
+    pattern = bytearray()
+    for _i in range(16):
+        char_key = ((length + 1) * string_key) & 0xFFFF
+        pattern += bytes([char_key & 0xFF, char_key >> 8]) if unit == 2 else bytes([char_key & 0xFF])
+        string_key = ((string_key << 1) | (string_key >> 15)) & 0xFFFF
+    n = unit * length
+    stream = (bytes(pattern) * (length // 16 + 1))[:n]
+    out = (int.from_bytes(data[at:at + n], "little") ^ int.from_bytes(stream, "little")).to_bytes(n, "little")
+    try:
+        return out.decode("utf-16-le" if unit == 2 else "utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def w3strings_lookup(path, hashes):
+    """{key hash: text} for just these keys of a .w3strings file, without decoding the rest: for
+    the game's own, which are large."""
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return {}
+    if len(data) < 14 or data[:4] != b"RTSW":
+        return {}
+    version = struct.unpack_from("<I", data, 4)[0]
+    if version not in _W3S_VERSIONS:
+        return {}
+    unit = _W3S_VERSIONS[version][1]
+    magic = _W3S_LANG_MAGIC.get(struct.unpack_from("<H", data, 8)[0] << 16 | struct.unpack_from("<H", data, len(data) - 2)[0])
+    if magic is None:
+        return {}
+    try:
+        n1, at = _w3s_count(data, 10)
+        entries_at = at
+        at += 12 * n1
+        n2, at = _w3s_count(data, at)
+        want = {}
+        for k, i in struct.iter_unpack("<II", data[at:at + 8 * n2]):
+            if k and k in hashes:
+                want[i] = k
+        at += 8 * n2
+        n3, pos = _w3s_count(data, at)
+        unit = _w3s_unit(data, pos, n3, unit)
+        if unit is None:
+            return {}
+        out = {}
+        if want:
+            for i, offset, length in struct.iter_unpack("<III", data[entries_at:entries_at + 12 * n1]):
+                if i in want:
+                    t = _w3s_text(data, pos, unit, magic, offset, length)
+                    if t is not None:
+                        out[want[i]] = t
+        return out
+    except (IndexError, struct.error):
+        return {}
+
+
 def w3strings_read(data, texts=False):
     """A .w3strings file -> {'format': '4.x' | '5.x', 'ids': {string ID}, 'keys': {key hash},
     'texts': {string ID: text} (with texts=True)}, or {'format': 'other'} for a version this
@@ -3303,31 +3433,22 @@ def w3strings_read(data, texts=False):
         entries = [struct.unpack_from("<III", data, pos + 12 * k) for k in range(n1)]
         pos += 12 * n1
         n2, pos = _w3s_count(data, pos)
-        keys = {struct.unpack_from("<I", data, pos + 8 * k)[0] for k in range(n2)}
+        key_pairs = [struct.unpack_from("<II", data, pos + 8 * k) for k in range(n2)]
+        keys = {k for k, _i in key_pairs}
         pos += 8 * n2
         n3, pos = _w3s_count(data, pos)
     except (IndexError, struct.error):
         return None
-    if pos + unit * n3 + 2 != len(data):              # the tables must account for every byte
+    # the tables must account for every byte. The text's width decides how it reads, not the
+    # version: a tool can write the 4.x version number with 5.00's one-byte text (No Artificial
+    # Player Light's strings), and 5.00 reads that like its own
+    unit = _w3s_unit(data, pos, n3, unit)
+    if unit is None:
         return None
+    name = "4.x" if unit == 2 else "5.x"
 
     def text(offset, length):
-        at = pos + unit * offset
-        if length > 1 << 16 or at + unit * length > len(data) - 2:
-            return None
-        string_key = (magic >> 8) & 0xFFFF
-        out = bytearray()
-        for i in range(length):
-            char_key = ((length + 1) * string_key) & 0xFFFF
-            if unit == 2:
-                out += bytes([data[at + 2 * i] ^ (char_key & 0xFF), data[at + 2 * i + 1] ^ (char_key >> 8)])
-            else:
-                out.append(data[at + i] ^ (char_key & 0xFF))
-            string_key = ((string_key << 1) | (string_key >> 15)) & 0xFFFF
-        try:
-            return out.decode("utf-16-le" if unit == 2 else "utf-8")
-        except UnicodeDecodeError:
-            return None
+        return _w3s_text(data, pos, unit, magic, offset, length)
 
     good = total = 0
     for _id, offset, length in entries[:40]:
@@ -3341,7 +3462,1230 @@ def w3strings_read(data, texts=False):
     out = {"format": name, "ids": {e[0] ^ magic for e in entries}, "keys": keys}
     if texts:
         out["texts"] = {e[0] ^ magic: (text(e[1], e[2]) or "") for e in entries}
+        # each string's key, by its hash (str_key_hash): how menus name their labels
+        # (a string with no key has hash 0: never a name)
+        out["key_texts"] = {k: out["texts"].get(i ^ magic, "") for k, i in key_pairs if k and (i ^ magic) in out["texts"]}
     return out
+
+
+MENU_LIST_KINDS = ("OPTIONS", "OPTIONSWITHCOND", "STEPPER")      # shown as a list of choices in the game
+
+
+def _menu_tags(el):
+    """A menu element's tags (tags="customNames;nonLocalized"), in lower case."""
+    return {t.lower() for t in re.split(r"[;,\s]+", el.get("tags") or "") if t}
+
+
+def parse_mod_menu(data):
+    """A mod's menu XML (user_config_matrix/pc) as the game reads it: [{'group': section id, 'path':
+    its displayName split at the dots ("Mods.bettercandles.bc_lights"), 'tags', 'presets': [{'name',
+    'entries': [(section, key, value)]}], 'items': [{'id', 'name', 'kind': TOGGLE / SLIDER / OPTIONS /
+    SEPARATOR / anything else as written, 'raw_kind', 'tags', 'default', 'min', 'max', 'steps'
+    (sliders), 'options': [{'name', 'entries': [(section, key, value)]}], 'hidden'}]}].
+    An entry's section is its overrideGroup when it has one, else that of the page's setting it
+    sets, else the group's. A list of choices (OPTIONS, STEPPER) with fewer than two is hidden, as
+    in the game, and so is a setting marked visibilityCondition="hideAlways". A switch with no
+    value starts off, a slider at 0 (the game's defaults), shown only where there's no value at
+    all; 'given' says whether the mod gives the value itself.
+    ValueError when it isn't readable XML."""
+    import xml.etree.ElementTree as ET
+    text = "\n".join(decode_script(data)[0])
+    try:
+        root = ET.fromstring(re.sub(r"^\s*<\?xml[^>]*\?>", "", text.lstrip("\ufeff"), count=1))
+    except ET.ParseError as e:
+        raise ValueError(str(e))
+    num = lambda v, d: (lambda f: f if f == f else d)(float(v)) if v not in (None, "") and re.fullmatch(r"\s*-?\d+(\.\d+)?\s*", v) else d
+    pages = []
+    for g in root.iter("Group"):
+        gid = (g.get("id") or "").strip()
+        if not gid:
+            continue
+        path = [p for p in (g.get("displayName") or gid).split(".") if p]
+
+        # a preset's or a choice's entry that names no overrideGroup sets this page's setting of that
+        # id, kept wherever the setting is kept: Brutal Blood's presets set DynamicDecalsLimit, which
+        # its menu keeps in the game's own [Rendering], not in [dec]
+        var_sections = {(v.get("id") or "").strip().lower(): (v.get("overrideGroup") or gid).strip()
+                        for v in g.iter("Var") if (v.get("id") or "").strip()}
+
+        def entries(el):
+            return [((e.get("overrideGroup") or var_sections.get((e.get("varId") or "").strip().lower()) or gid).strip(),
+                     (e.get("varId") or "").strip(), (e.get("value") or "").strip())
+                    for e in el.iter("Entry") if (e.get("varId") or "").strip()]
+        presets = [{"name": pr.get("displayName") or pr.get("id") or "", "entries": entries(pr)} for pr in g.iter("Preset")]
+        items = []
+        holder = g.find("VisibleVars")
+        for v in (holder if holder is not None else g).iter("Var"):
+            parts = (v.get("displayType") or "").split(";")
+            raw = parts[0].strip().upper()
+            kind = ("OPTIONS" if raw in MENU_LIST_KINDS else "SEPARATOR" if raw in ("SEPARATOR", "SUBTLE_SEPARATOR")
+                    else "TOGGLE" if raw in ("TOGGLE", "TOGGLESTEPPER") else raw)
+            value = v.get("value")
+            item = {"id": (v.get("id") or "").strip(), "name": v.get("displayName") or v.get("id") or "",
+                    "kind": kind, "raw_kind": raw, "tags": _menu_tags(v), "default": value.strip() if value is not None else None,
+                    "given": value is not None and value.strip() != "",     # the mod gives it a default itself
+                    # where its value is kept: its own overrideGroup when it names one (No Artificial
+                    # Player Light keeps them all in [NoArtificialPlayerLight]), else the group's
+                    "section": (v.get("overrideGroup") or gid).strip()}
+            if kind == "SLIDER":
+                lo, hi = num(parts[1] if len(parts) > 1 else None, 0.0), num(parts[2] if len(parts) > 2 else None, 100.0)
+                steps = int(num(parts[3] if len(parts) > 3 else None, 100)) or 100
+                item.update(min=min(lo, hi), max=max(lo, hi), steps=max(1, steps))
+                if item["default"] in (None, ""):
+                    item["default"] = "0"
+            elif kind == "TOGGLE":
+                if item["default"] in (None, ""):
+                    item["default"] = "false"
+            elif kind == "OPTIONS":
+                item["options"] = [{"name": o.get("displayName") or o.get("id") or "", "entries": entries(o)}
+                                   for o in v.iter("Option")]
+                item["hidden"] = len(item["options"]) < 2
+            cond = (v.get("visibilityCondition") or "").strip()
+            if cond.lower() == "hidealways":
+                item["hidden"] = True        # never shown in the game (a mod's own bookkeeping: Enhanced
+                #                              Camera's version and first-run flag); its value still kept
+            elif cond:
+                item["condition"] = cond     # shown while a script turns that tag on (see script_tag_states)
+            if item["id"] or kind == "SEPARATOR":
+                items.append(item)
+        if not any(it["kind"] != "SEPARATOR" and not it.get("hidden") for it in items):
+            continue                       # a group with nothing to show isn't a page in the game either
+        pages.append({"group": gid, "path": path, "tags": _menu_tags(g), "presets": presets, "items": items})
+    return pages
+
+
+def rewrite_menu_xml(data, hide=False, places=None):
+    """A copy of a mod's menu file for the game, the mod's own file untouched. hide: the game
+    reads it but doesn't show it: every setting kept, with its values (the game only keeps values
+    it has a setting for), each marked visibilityCondition="hideAlways" (the game's own condition
+    nothing ever turns on), its presets left out (the game counts them as something to show). A
+    page with nothing to show isn't listed in the game's menu (igmOptions.ws:
+    IngameMenu_FillSubMenuOptionsList), but the game only takes back the page itself: a folder
+    made for it ("Mods.BrothersInArms_Name" for "Mods.BrothersInArms_Name.BrothersInArms_Optional")
+    would stay, with just Back in it. So each hidden page also gets a one-level place of its own
+    (displayName "<group id>_w3mmHidden"), which the game takes back whole. places: {group id
+    (lower): displayName}, where pages go in the game's menu (menu_flatten_plan). Where values are
+    kept doesn't depend on displayName. Same encoding as the file; None when it isn't a menu
+    file this can read."""
+    if data.startswith(codecs.BOM_UTF16_LE) or data.startswith(codecs.BOM_UTF16_BE) or data[:200].count(b"\0") > 20:
+        enc = "utf-16"
+    else:
+        enc = "utf-8-sig" if data.startswith(codecs.BOM_UTF8) else "utf-8"
+    try:
+        text = data.decode(enc)
+    except UnicodeDecodeError:
+        return None
+    if "<UserConfig" not in text or "<Var" not in text:
+        return None
+    places = {k.lower(): v for k, v in (places or {}).items()}
+
+    def var(m):
+        tag = re.sub(r'\s+visibilityCondition\s*=\s*"[^"]*"', "", m.group(0))
+        return re.sub(r"(\s*/?>)$", r' visibilityCondition="hideAlways"\1', tag, count=1)
+
+    def group(m):
+        gid = re.search(r'\bid\s*=\s*"([^"]*)"', m.group(0))
+        gid = gid.group(1) if gid else ""
+        if hide:
+            place = re.sub(r"[^\w]", "_", gid or "group") + "_w3mmHidden"
+        elif gid.lower() in places:
+            place = places[gid.lower()]
+        else:
+            return m.group(0)
+        if re.search(r'\bdisplayName\s*=\s*"[^"]*"', m.group(0)):
+            return re.sub(r'\bdisplayName\s*=\s*"[^"]*"', f'displayName="{place}"', m.group(0), count=1)
+        return re.sub(r"(\s*/?>)$", f' displayName="{place}"\\1', m.group(0), count=1)
+    if hide:
+        text = re.sub(r"<Var\b[^>]*>", var, text)
+    text = re.sub(r"<Group\b[^>]*>", group, text)
+    if hide:
+        text = re.sub(r"\s*<PresetsArray\b[^>]*/>", "", text)
+        text = re.sub(r"\s*<PresetsArray\b.*?</PresetsArray>", "", text, flags=re.S)
+    return text.encode("utf-16") if enc == "utf-16" else (codecs.BOM_UTF8 if enc == "utf-8-sig" else b"") + text.encode("utf-8")
+
+
+def hide_menu_xml(data):
+    """A mod's menu file the game reads but doesn't show (see rewrite_menu_xml)."""
+    return rewrite_menu_xml(data, hide=True)
+
+
+def menu_groups(data):
+    """[(group id, displayName, has settings the game shows)] of a menu file, without reading it
+    as XML (so a file the game takes but a strict reader wouldn't still counts)."""
+    text = "\n".join(decode_script(data)[0])
+    out = []
+    for g in re.finditer(r"<Group\b([^>]*)>(.*?)</Group>|<Group\b([^>]*)/>", text, re.S):
+        attrs = g.group(1) or g.group(3) or ""
+        gid = re.search(r'\bid\s*=\s*"([^"]*)"', attrs)
+        dn = re.search(r'\bdisplayName\s*=\s*"([^"]*)"', attrs)
+        if gid:
+            # has settings: one the game shows (not one marked hideAlways, a mod's own bookkeeping)
+            shown = any(not re.search(r'visibilityCondition\s*=\s*"hideAlways"', v, re.I)
+                        for v in re.findall(r"<Var\b[^>]*>", g.group(2) or ""))
+            out.append((gid.group(1), (dn.group(1) if dn else gid.group(1)), shown))
+    return out
+
+
+def menu_flatten_plan(groups, risky=()):
+    """Where pages go in the game's menu so a folder holding one page doesn't take an extra click
+    ("Mods.DynamicScabbards.Settings" -> "Mods.DynamicScabbards": clicking the mod opens its
+    settings). groups: [(owner, group id, displayName, has settings)] of every menu in the game;
+    owner None for one the app doesn't place (it counts, but stays as it is). A page moves up
+    into its folder when it's the folder's only page (other menus' pages included), nothing is
+    already at the folder's own place, the folder isn't a top level ("Mods"), and no script in the
+    game names the page ("risky": the menu ids scripts compare, as Sharedutils' descriptors do:
+    such a mod would lose its descriptions). Repeated, so a chain of single folders folds up.
+    Returns {(owner, group id lower): new displayName}."""
+    risky = {r.lower() for r in risky}
+    segs = {(o, g.lower()): [p for p in dn.split(".") if p] for o, g, dn, has in groups if has}
+    moved = {}
+    for _round in range(8):
+        children, pages = {}, set()
+        for path in segs.values():
+            pages.add(tuple(p.lower() for p in path))
+            for k in range(1, len(path)):
+                children.setdefault(tuple(p.lower() for p in path[:k]), set()).add(path[k].lower())
+        change = False
+        for key, path in segs.items():
+            if key[0] is None or len(path) < 3:
+                continue
+            parent = tuple(p.lower() for p in path[:-1])
+            if len(children.get(parent, ())) == 1 and parent not in pages and path[-1].lower() not in risky:
+                segs[key] = path[:-1]
+                moved[key] = ".".join(path[:-1])
+                change = True
+        if not change:
+            break
+    return moved
+
+
+def menu_value_fits(item, value):
+    """Is a value one a menu setting can show: a number within a slider's range, true or false
+    for a switch, a choice's number for a list?"""
+    v = str(value).strip()
+    if item["kind"] == "TOGGLE":
+        return v.lower() in ("true", "false")
+    if item["kind"] == "SLIDER":
+        try:
+            return item["min"] <= float(v) <= item["max"]
+        except ValueError:
+            return False
+    if item["kind"] == "OPTIONS":
+        return v.isdigit() and int(v) < len(item.get("options") or [])
+    return bool(v)
+
+
+def menu_item_key(page, item):
+    """(section, key) in lower case where a menu setting's value is kept."""
+    return ((item.get("section") or page["group"]).lower(), item["id"].lower())
+
+
+def menu_label_found(strings, kind, name, tags=()):
+    """The same as menu_label, or None when the strings have no text for it. The key the game
+    uses is looked up everywhere it would be (the mod's strings, other mods', the game's); the
+    other spelling, a leniency of the app's, only in the mod's own strings, so a short or plain
+    name never picks up some unrelated text elsewhere."""
+    tags = {t.lower() for t in tags}
+    if kind == "choice" and "nonlocalized" in tags:
+        return name
+    if not (name or "").strip():
+        return None
+    pre = {"page": "panel_", "item": "option_", "value": "preset_value_", "choice": "preset_value_"}[kind]
+    plain = (kind in ("page", "item") and "customdisplayname" in tags) or (kind == "choice" and "customnames" in tags)
+    first, other = (name, pre + name) if plain else (pre + name, name)
+    localize = getattr(strings, "localize", None)
+    if localize and kind != "page":                  # the game names pages from the strings alone
+        for key in (first, other):
+            hit = localize(key)
+            if hit:
+                return hit
+    own = strings.own if isinstance(strings, LayeredStrings) else strings
+    for key, where in ((first, strings), (other, own)):
+        hit = where.get(str_key_hash(key))
+        if hit:
+            return hit.replace("\xa0", " ").strip()
+    return None
+
+
+class LayeredStrings:
+    """A mod's strings, then (only when a key isn't there) every installed mod's, then the game's
+    own: the game loads them all together, so a menu may use names another part of the same mod
+    brings, or the game's ("title_alchemy": its Alchemy screen's name)."""
+
+    def __init__(self, own, more, game=None):
+        self.own, self.more, self.game, self._all = own, more, game, None
+        self.localize = None            # the game's inGameMenu_TryLocalize as mods change it (menu_localizer)
+
+    def get(self, key, default=None):
+        hit = self.own.get(key)
+        if hit is None:
+            if self._all is None:
+                self._all = self.more() or {}
+            hit = self._all.get(key)
+        if hit is None and self.game:
+            hit = self.game(key)
+        return default if hit is None else hit
+
+    def __bool__(self):
+        return bool(self.own)
+
+
+def menu_label(strings, kind, name, tags=()):
+    """A menu name as the game shows it, from the mod's strings (igmOptions.ws): a page segment
+    (panel_…), a setting (option_…), a preset (preset_value_…), a choice in a list (preset_value_…;
+    its own name with the customNames tag, as written with nonLocalized). The customDisplayName
+    tag drops the prefix of a page or a setting. When the game's key has no string, the other
+    spelling is tried, then the name is shown as written when it reads as text, else as a tidied
+    key ("bc_lights" -> "Bc lights"); the game would show "##key" there."""
+    hit = menu_label_found(strings, kind, name, tags)
+    if hit:
+        return hit
+    if " " in name or not re.search(r"[_.]", name):
+        return name
+    tail = name.rsplit(".", 1)[-1]
+    return tail.replace("_", " ").strip().capitalize()
+
+
+def menu_item_tip(strings, page, item):
+    """A setting's description, when the mod has one under a name the app can guess: the mod's
+    name and _tip_ or _desc_ and the setting's id ("bettercandles_tip_brightness"), or its
+    displayName and _desc / _tip. '' otherwise."""
+    strings = strings.own if isinstance(strings, LayeredStrings) else strings   # guesses: the mod's own strings only
+    prefix = page["path"][1] if len(page["path"]) > 1 else item["name"].split("_")[0]
+    for key in (f"{prefix}_tip_{item['id']}", f"{prefix}_desc_{item['id']}", f"{item['name']}_desc",
+                f"{item['name']}_tip", f"{item['name']}_description", f"option_{item['name']}_tip",
+                f"option_{item['name']}_desc", f"{item['name']}_tooltip"):
+        hit = strings.get(str_key_hash(key))
+        if hit:
+            return hit
+    return ""
+
+
+_WS_STR = r'"((?:[^"\\]|\\.)*)"'
+
+
+def _ws_strip_comments(text):
+    """A script without its comments (// to the line's end, /* … */); a // inside a string
+    ("img://…") stays."""
+    return re.sub(r'("(?:[^"\\\n]|\\.)*"|\'(?:[^\'\\\n]|\\.)*\')|//[^\n]*|/\*.*?\*/',
+                  lambda m: m.group(1) or "", text, flags=re.S)
+
+
+def _ws_unescape(text):
+    return re.sub(r"\\(.)", lambda m: {"n": "\n", "t": "\t"}.get(m.group(1), m.group(1)), text)
+
+
+def _ws_body(text, start):
+    """The text between the first { after start and its matching }, or ''."""
+    i = text.find("{", start)
+    if i < 0:
+        return ""
+    depth = 0
+    for j in range(i, len(text)):
+        if text[j] == "{":
+            depth += 1
+        elif text[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[i + 1:j]
+    return text[i + 1:]
+
+
+def _ws_args(text, start):
+    """The arguments of a call whose ( is at start, as source text, split at its top-level
+    commas; (args, index after the closing paren)."""
+    depth, args, cur, i, quote = 0, [], [], start + 1, None
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            cur.append(ch)
+            if ch == "\\" and i + 1 < len(text):
+                cur.append(text[i + 1])
+                i += 1
+            elif ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+            cur.append(ch)
+        elif ch in "([{":
+            depth += 1
+            cur.append(ch)
+        elif ch in ")]}":
+            if depth == 0:
+                args.append("".join(cur).strip())
+                return args, i + 1
+            depth -= 1
+            cur.append(ch)
+        elif ch == "," and depth == 0:
+            args.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+        i += 1
+    return args, i
+
+
+def parse_menu_descriptors(text):
+    """What a script tells the game's menu to show as descriptions, through Sharedutils' menu
+    descriptors (tw3-shared-utils, mod_sharedutils_menudescriptors) or a copy of them under other
+    names (Eternal Hunt's ACS_MenuDescriptor): {'classes': {class: {'base', 'hover': [(setting id,
+    raw text, string key)], 'fallback': (raw text, string key)}}, 'menus': [(menu id, class)],
+    'functions': {name: (parameters, body)}}. The texts are kept as source (a "literal", a string
+    by its key or number, or an expression joining strings through the script's own functions:
+    Rational Inventory Icons builds its with <img> tags), worked out by WSStringEval. A class lists
+    this.onHover('Setting', text, key) (in build() or any of its methods), withFallbackMessage(text,
+    key) for the page's own text; a function that adds it for a menu (SU_onMenuEntered: menu ==
+    "title_alchemy" … descriptors.PushBack(new X)) ties it to the page whose path ends there."""
+    return _parse_menu_descriptors(text)
+
+
+@functools.lru_cache(maxsize=64)
+def _parse_menu_descriptors(text):
+    classes, menus = {}, []
+    text = _ws_strip_comments(text)
+    for c in re.finditer(r"\bclass\s+(\w+)(?:\s+extends\s+(\w+))?[^{;]*\{", text):
+        body = _ws_body(text, c.end() - 1)
+        rec = {"base": c.group(2) or "", "hover": [], "fallback": None}
+        for h in re.finditer(r"(?<!function )\bonHover(?:Dynamic)?\s*\(", body):
+            args, _end = _ws_args(body, h.end() - 1)
+            name = re.fullmatch(r"'([^']*)'|\"([^\"]*)\"", args[0]) if args else None
+            if name:
+                rec["hover"].append((name.group(1) or name.group(2), args[1] if len(args) > 1 else "",
+                                     args[2] if len(args) > 2 else ""))
+        for f in re.finditer(r"(?<!function )\bwithFallbackMessage\s*\(", body):
+            args, _end = _ws_args(body, f.end() - 1)
+            if args and not re.search(r":\s*\w", args[0]):      # a call, not the method's own definition
+                rec["fallback"] = (args[0], args[1] if len(args) > 1 else "")
+                break
+        classes[c.group(1)] = rec
+    functions = parse_ws_functions(text)
+    for _name, (_params, body) in functions.items():
+        if "PushBack" not in body or "menu" not in body:
+            continue
+        for part in re.split(r"\bif\s*\(", body)[1:]:
+            ids = re.findall(r"\bmenu\s*==\s*" + _WS_STR, part)
+            for cls in re.findall(r"\bPushBack\s*\(\s*new\s+(\w+)", part):
+                menus += [(_ws_unescape(i), cls) for i in ids]
+    return {"classes": classes, "menus": menus, "functions": functions}
+
+
+@functools.lru_cache(maxsize=64)
+def parse_ws_functions(text):
+    """{name: ([parameter names], body)} of the functions in a script (global ones and methods,
+    @addMethod ones included)."""
+    out = {}
+    for f in re.finditer(r"(?<![\w@])(?:function|event)\s+(\w+)\s*\(([^)]*)\)\s*(?::\s*[\w<> ]+)?\s*\{", text):
+        params = []
+        for p in f.group(2).split(","):
+            p = re.sub(r"\b(optional|out)\b", "", p.split(":")[0]).strip()
+            if p:
+                params.append(p)
+        out[f.group(1)] = (params, _ws_body(text, f.end() - 1))
+    return out
+
+
+class WSStringEval:
+    """Works out a WitcherScript string expression the way the game would, for what a menu
+    shows: string, name ('x') and number literals joined with +, comparisons (==, !=, &&, ||, !),
+    the parameters and variables of the script's own functions (var lines, assignments, if / else,
+    switch / case, return), the game's GetLocStringByKey(Ext) through loc and GetLocStringById
+    through loc_id, the game's text language (GetGameLanguageName) through lang, the game's string
+    functions (StrFindFirst, StrAfterFirst and the like), number comparisons and loops that count
+    from one number to another. Anything else (other loops, arithmetic, a call it doesn't know,
+    the game's state): None, never a guess. more: called once when a function isn't in
+    functions, for the rest of the mod's (its other scripts)."""
+    TOKEN = re.compile(r'\s*(?:("(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\')|(\d+(?:\.\d+)?)|(\w+)|(\S))', re.S)
+    _parsed = {}
+
+    def __init__(self, functions, loc, loc_id=None, more=None, lang=None):
+        self.functions, self.loc, self.loc_id, self.more, self.depth = functions, loc, loc_id, more, 0
+        self.lang = lang
+
+    def eval(self, src, env=None):
+        got = self._run_expr(src, env)
+        return got if isinstance(got, str) else None
+
+    def test(self, src, env=None):
+        """A condition's value: True / False, or None when it can't be worked out."""
+        got = self._run_expr(src, env)
+        try:
+            return self._truth(got) if got is not None else None
+        except ValueError:
+            return None
+
+    def _run_expr(self, src, env):
+        saved = getattr(self, "toks", None), getattr(self, "i", 0)
+        try:
+            self.toks = [t for t in self.TOKEN.findall(src or "") if any(t)]
+            self.i = 0
+            if not self.toks:
+                return ""
+            out = self._or(env if env is not None else {})
+            return out if self.i == len(self.toks) else None
+        except (ValueError, IndexError, RecursionError, TypeError):
+            return None
+        finally:
+            self.toks, self.i = saved
+
+    def _peek(self, k=0):
+        return self.toks[self.i + k] if self.i + k < len(self.toks) else ("", "", "", "")
+
+    @staticmethod
+    def _truth(v):
+        if isinstance(v, bool):
+            return v
+        if v in ("true", "false"):
+            return v == "true"
+        raise ValueError("not a condition")
+
+    def _or(self, env):
+        out = self._and(env)
+        while self._peek()[3] == "|" and self._peek(1)[3] == "|":
+            self.i += 2
+            right = self._and(env)
+            out = self._truth(out) or self._truth(right)
+        return out
+
+    def _and(self, env):
+        out = self._not(env)
+        while self._peek()[3] == "&" and self._peek(1)[3] == "&":
+            self.i += 2
+            right = self._not(env)
+            out = self._truth(out) and self._truth(right)
+        return out
+
+    def _not(self, env):
+        if self._peek()[3] == "!" and self._peek(1)[3] != "=":
+            self.i += 1
+            return not self._truth(self._not(env))
+        return self._cmp(env)
+
+    @staticmethod
+    def _number(v):
+        if isinstance(v, bool) or not re.fullmatch(r"-?\d+(\.\d+)?", str(v)):
+            raise ValueError("not a number")
+        return float(v)
+
+    def _cmp(self, env):
+        out = self._expr(env)
+        a, b = self._peek()[3], self._peek(1)[3]
+        if a in ("<", ">"):
+            self.i += 2 if b == "=" else 1
+            left, right = self._number(out), self._number(self._expr(env))
+            return {"<": left < right, ">": left > right, "<=": left <= right,
+                    ">=": left >= right}[a + ("=" if b == "=" else "")]
+        if (a, b) in (("=", "="), ("!", "=")):
+            self.i += 2
+            right = self._expr(env)
+            if isinstance(out, bool) or isinstance(right, bool):
+                same = out == right
+            else:
+                same = str(out).lower() == str(right).lower()    # names: the game's are case-blind
+            return same if a == "=" else not same
+        return out
+
+    def _expr(self, env):
+        out = self._term(env)
+        while self._peek()[3] == "+" and self._peek(1)[3] != "=":
+            self.i += 1
+            right = self._term(env)
+            if isinstance(out, bool) or isinstance(right, bool):
+                raise ValueError("+ of a condition")
+            out += right
+        return out
+
+    def _term(self, env):
+        s, num, ident, sym = self._peek()
+        self.i += 1
+        if s:
+            return _ws_unescape(s[1:-1])
+        if num:
+            return num
+        if sym == "-" and self._peek()[1]:          # a negative number
+            self.i += 1
+            return "-" + self.toks[self.i - 1][1]
+        if sym == "(":
+            out = self._or(env)
+            if self._peek()[3] != ")":
+                raise ValueError("(")
+            self.i += 1
+            return out
+        if ident:
+            if ident in ("this", "parent", "super") and self._peek()[3] == ".":
+                self.i += 1
+                return self._term(env)
+            if self._peek()[3] == "(":
+                self.i += 1
+                args = []
+                while self._peek()[3] != ")":
+                    args.append(self._or(env))
+                    if self._peek()[3] == ",":
+                        self.i += 1
+                    elif self._peek()[3] != ")":
+                        raise ValueError("args")
+                self.i += 1
+                return self._call(ident, args)
+            if ident in env:
+                return env[ident]
+            if ident in ("true", "false"):
+                return ident == "true"
+        raise ValueError(ident or sym)
+
+    def _call(self, name, args):
+        args = [a if isinstance(a, bool) else str(a) for a in args]
+        first = args[0] if args else ""
+        if name in ("GetLocStringByKeyExt", "GetLocStringByKey"):
+            return self.loc(first) or ""
+        if name == "GetLocStringById":
+            if not self.loc_id or not re.fullmatch(r"\d+", str(first)):
+                raise ValueError(name)
+            return self.loc_id(int(first)) or ""
+        if name in ("IntToString", "FloatToString", "NameToString", "StringToName", "StrLower", "StrUpper"):
+            return first.lower() if name == "StrLower" else first.upper() if name == "StrUpper" else first
+        if name in ("StrBeginsWith", "StrEndsWith") and len(args) == 2:
+            a, b = str(args[0]).lower(), str(args[1]).lower()
+            return a.startswith(b) if name == "StrBeginsWith" else a.endswith(b)
+        if name in ("StrReplace", "StrReplaceAll") and len(args) == 3:
+            return args[0].replace(args[1], args[2], 1 if name == "StrReplace" else -1)
+        if any(isinstance(a, bool) for a in args) and name.startswith("Str"):
+            raise ValueError(name)
+        if name in ("StrFindFirst", "StrFindLast") and len(args) == 2:
+            return str(args[0].find(args[1]) if name == "StrFindFirst" else args[0].rfind(args[1]))
+        if name in ("StrAfterFirst", "StrBeforeFirst", "StrAfterLast", "StrBeforeLast") and len(args) == 2:
+            text, sep = args
+            at = text.find(sep) if name.endswith("First") else text.rfind(sep)
+            if at < 0 or not sep:
+                return ""                          # the game's: nothing when the text isn't there
+            return text[at + len(sep):] if name.startswith("StrAfter") else text[:at]
+        if name == "StrLen" and len(args) == 1:
+            return str(len(args[0]))
+        if name not in self.functions and self.more:
+            more, self.more = self.more, None
+            self.functions = {**(more() or {}), **self.functions}
+        if name not in self.functions or self.depth > 20:
+            raise ValueError(name)
+        params, body = self.functions[name]
+        env = {p: (args[k] if k < len(args) else "") for k, p in enumerate(params)}
+        self.depth += 1
+        try:
+            got = self.run(body, env)
+        finally:
+            self.depth -= 1
+        if got and got[0] == "return":
+            return got[1]
+        raise ValueError("no return")
+
+    # statements: parsed once per body, then run
+    @classmethod
+    def parse_block(cls, body):
+        hit = cls._parsed.get(body)
+        if hit is None:
+            if len(cls._parsed) > 4000:
+                cls._parsed.clear()
+            hit = cls._parsed[body] = cls._stmts(body)
+        return hit
+
+    @staticmethod
+    def _skip(text, i):
+        while i < len(text) and text[i].isspace():
+            i += 1
+        return i
+
+    @staticmethod
+    def _close(text, i, stop=";"):
+        """The index of the first stop character at depth 0 from i, outside strings."""
+        depth, quote = 0, None
+        while i < len(text):
+            ch = text[i]
+            if quote:
+                if ch == "\\":
+                    i += 1
+                elif ch == quote:
+                    quote = None
+            elif ch in "\"'":
+                quote = ch
+            elif ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                if depth == 0:
+                    return i
+                depth -= 1
+            elif depth == 0 and ch in stop:
+                return i
+            i += 1
+        return len(text)
+
+    @classmethod
+    def _paren(cls, text, i):
+        """(inside, index after) of the (…) starting at text[i]."""
+        if i >= len(text) or text[i] != "(":
+            raise ValueError("(")
+        j = cls._close(text, i + 1, ")")
+        return text[i + 1:j], j + 1
+
+    @classmethod
+    def _stmts(cls, text):
+        out, i = [], 0
+        while True:
+            i = cls._skip(text, i)
+            if i >= len(text):
+                return out
+            st, i = cls._stmt(text, i)
+            if st:
+                out.append(st)
+
+    @classmethod
+    def _stmt(cls, text, i):
+        if text[i] == "{":
+            j = cls._close(text, i + 1, "}")
+            return ("block", cls._stmts(text[i + 1:j])), j + 1
+        if text[i] == ";":
+            return None, i + 1
+        word = re.match(r"(if|switch|while|for|do|return|break|continue|var|case|default)\b", text[i:i + 9])
+        word = word.group(1) if word else ""
+        if word == "if":
+            cond, k = cls._paren(text, cls._skip(text, i + 2))
+            then, k = cls._stmt(text, cls._skip(text, k))
+            j = cls._skip(text, k)
+            if re.match(r"else\b", text[j:j + 5]):
+                other, k = cls._stmt(text, cls._skip(text, j + 4))
+                return ("if", cond, then or ("block", []), other), k
+            return ("if", cond, then or ("block", []), None), k
+        if word == "switch":
+            value, k = cls._paren(text, cls._skip(text, i + 6))
+            k = cls._skip(text, k)
+            if k >= len(text) or text[k] != "{":
+                raise ValueError("switch")
+            j = cls._close(text, k + 1, "}")
+            return ("switch", value, cls._stmts(text[k + 1:j])), j + 1
+        if word in ("case", "default"):
+            j = cls._close(text, i + len(word), ":")
+            return (("case", text[i + 4:j].strip()) if word == "case" else ("default",)), j + 1
+        if word in ("while", "for"):
+            inside, k = cls._paren(text, cls._skip(text, i + len(word)))
+            body, k = cls._stmt(text, cls._skip(text, k))
+            return ("loop", body, word, inside), k
+        if word == "do":
+            body, k = cls._stmt(text, cls._skip(text, i + 2))
+            k = cls._close(text, k)
+            return ("loop", body), k + 1
+        j = cls._close(text, i)
+        src = text[i:j].strip()
+        if word == "return":
+            return ("return", src[6:].strip()), j + 1
+        if word in ("break", "continue"):
+            return ("break",), j + 1
+        if word == "var":
+            return ("var",), j + 1
+        m = re.fullmatch(r"(\w+)\s*(\+=|=)(?!=)\s*(.*)", src, re.S)
+        if m:
+            return ("assign", m.group(1), m.group(2), m.group(3)), j + 1
+        return ("expr", src), j + 1
+
+    def run(self, body, env):
+        """Runs a function's body: ('return', value), or None when it ends without one; ValueError
+        for anything it can't follow."""
+        got = self._exec(self.parse_block(body), env)
+        return got if got and got[0] == "return" else None
+
+    def _exec(self, stmts, env):
+        for st in stmts:
+            got = self._exec1(st, env)
+            if got:
+                return got
+        return None
+
+    def _value(self, src, env):
+        inner = WSStringEval(self.functions, self.loc, self.loc_id, self.more, self.lang)
+        inner.depth = self.depth
+        got = inner._run_expr(src, env)
+        self.functions, self.more = inner.functions, inner.more
+        if got is None:
+            raise ValueError(src[:20])
+        return got
+
+    def _exec1(self, st, env):
+        kind = st[0]
+        if kind == "block":
+            return self._exec(st[1], env)
+        if kind == "var":
+            return None
+        if kind == "if":
+            if self._truth(self._value(st[1], env)):
+                return self._exec1(st[2], env)
+            return self._exec1(st[3], env) if st[3] else None
+        if kind == "switch":
+            value, items = str(self._value(st[1], env)).lower(), st[2]
+            start = next((k for k, it in enumerate(items) if it[0] == "case"
+                          and str(self._value(it[1], env)).lower() == value), None)
+            if start is None:
+                start = next((k for k, it in enumerate(items) if it[0] == "default"), None)
+            for it in items[start:] if start is not None else ():
+                if it[0] in ("case", "default"):
+                    continue
+                got = self._exec1(it, env)
+                if got:
+                    return None if got[0] == "break" else got
+            return None
+        if kind == "return":
+            return ("return", self._value(st[1], env) if st[1] else "")
+        if kind == "break":
+            return ("break",)
+        if kind == "assign":
+            v = self._value(st[3], env)
+            env[st[1]] = (str(env.get(st[1], "")) + str(v)) if st[2] == "+=" else v
+            return None
+        if kind == "expr" and re.match(r"(Log\w*)\s*\(", st[1]):
+            return None
+        if kind == "expr" and self.lang:
+            lang = re.fullmatch(r"(?:theGame\s*\.\s*)?GetGameLanguageName\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)", st[1])
+            if lang:                               # the text language as the game names it ("EN", "ESMX")
+                env.pop(lang.group(1), None)       # the spoken one isn't known
+                env[lang.group(2)] = self.lang.upper()
+                return None
+        if kind == "loop" and len(st) > 2 and st[2] == "for":
+            return self._count(st, env)
+        raise ValueError(kind)
+
+    def _count(self, st, env):
+        """A for loop that counts from one number to another (for (i = 1; i <= 4; i += 1)), run
+        as the game would; any other loop: ValueError."""
+        parts = [p.strip() for p in st[3].split(";")]
+        if len(parts) != 3:
+            raise ValueError("for")
+        init = re.fullmatch(r"(\w+)\s*=\s*(-?\d+)", parts[0])
+        if not init:
+            raise ValueError("for")
+        var, step = init.group(1), parts[2].replace(" ", "")
+        by = {var + "+=1": 1, var + "++": 1, var + "=" + var + "+1": 1,
+              var + "-=1": -1, var + "--": -1, var + "=" + var + "-1": -1}.get(step)
+        if by is None or not re.search(r"\b" + var + r"\b", parts[1]):
+            raise ValueError("for")
+        env[var] = init.group(2)
+        for _n in range(1000):
+            if not self._truth(self._value(parts[1], env)):
+                return None
+            got = self._exec1(st[1], env)
+            if got:
+                return None if got[0] == "break" else got
+            env[var] = str(int(env[var]) + by)
+        raise ValueError("for")
+
+
+_TIP_SINKS = re.compile(r"\b(GetLocStringByKeyExt|GetLocStringByKey|GetLocStringById|FlashArgString|ShowNotification)\s*\(")
+
+
+def parse_option_hooks(text):
+    """[(setting parameter, body)] of a script's functions the game's menu calls with the setting
+    the pointer is on, where mods show their descriptions: OnOptionSelectionChanged (as wraps of
+    it, or a whole ingameMenu.ws) and SetDescriptionText."""
+    return _parse_option_hooks(text)
+
+
+@functools.lru_cache(maxsize=64)
+def _parse_option_hooks(text):
+    if "OnOptionSelectionChanged" not in text and "SetDescriptionText" not in text:
+        return ()
+    text = _ws_strip_comments(text)
+    out = []
+    for fn in re.finditer(r"\b(?:function|event)\s+(?:OnOptionSelectionChanged|SetDescriptionText)\s*\(([^)]*)\)", text):
+        params = [p for p in fn.group(1).split(",") if p.strip()]
+        names = [re.sub(r"\b(optional|out)\b", "", p.split(":")[0]).strip() for p in params]
+        param = next((n for n, p in zip(names, params) if re.search(r":\s*name\b", p)), None)
+        if param:
+            out.append((param, [n for n in names if n != param], _ws_body(text, fn.end())))
+    return tuple(out)
+
+
+class WSTipTrace:
+    """What a menu hook (parse_option_hooks) would show for one setting: follows its body as the
+    game would run it with that setting's name, through the script's own functions, and collects
+    every text it hands to the game's screens (FlashArgString, ShowNotification) or reads from the
+    strings (GetLocStringBy…). A condition it can't work out (the game's state) is followed both
+    ways; a loop once. tips(): the texts found for a setting and not for a name no setting has,
+    so a text every setting would get (a "saved" note) is never one."""
+
+    def __init__(self, functions, loc, loc_id=None, more=None, lang=None):
+        self.ev = WSStringEval(functions, loc, loc_id, more, lang)
+
+    def tips(self, hook, setting):
+        mine, none = self._texts(hook, setting), self._texts(hook, "\x01")
+        out = []
+        for t in mine:
+            if t and t.strip() and t not in none and t not in out:
+                out.append(t)
+        return out
+
+    def _texts(self, hook, setting):
+        param, others, body = hook
+        self.param = param
+        env = {param: setting}
+        env.update({o: True for o in others})            # value: the pointer came onto the setting
+        out = []
+        try:
+            self._trace(self.ev.parse_block(body), env, out, 0)
+        except (ValueError, RecursionError, IndexError):
+            pass
+        return out
+
+    def _sinks(self, src, env, out, depth):
+        """The texts handed on in a statement, and the mod's own functions it calls with them."""
+        for s in _TIP_SINKS.finditer(src):
+            args, _end = _ws_args(src, s.end() - 1)
+            if not args:
+                continue
+            what = src[s.start():_end] if s.group(1).startswith("GetLoc") else args[0]
+            got = self.ev._run_expr(what, env)
+            if isinstance(got, str) and got:
+                out.append(got)
+        if depth < 6:
+            for c in re.finditer(r"(?:\bthis\s*\.\s*)?\b(\w+)\s*\(", src):
+                name = c.group(1)
+                if (name not in self.ev.functions and self.ev.more and not _TIP_SINKS.match(src, c.start())
+                        and re.search(r"\b" + re.escape(self.param) + r"\b", src[c.end():])):
+                    more, self.ev.more = self.ev.more, None     # the rest of the mod's scripts, when needed
+                    self.ev.functions = {**(more() or {}), **self.ev.functions}
+                if name in self.ev.functions and not _TIP_SINKS.match(src, c.start()) and name not in (
+                        "wrappedMethod", "super"):
+                    args, _end = _ws_args(src, c.end() - 1)
+                    vals = [self.ev._run_expr(a, env) for a in args]
+                    if all(v is not None for v in vals):
+                        params, body = self.ev.functions[name]
+                        sub = {p: (vals[k] if k < len(vals) else "") for k, p in enumerate(params)}
+                        try:
+                            self._trace(self.ev.parse_block(body), sub, out, depth + 1)
+                        except (ValueError, RecursionError, IndexError):
+                            pass
+
+    def _trace(self, stmts, env, out, depth):
+        """'stop' when the body certainly returns."""
+        for st in stmts:
+            if self._trace1(st, env, out, depth) == "stop":
+                return "stop"
+        return None
+
+    def _trace1(self, st, env, out, depth):
+        kind = st[0]
+        if kind == "block":
+            return self._trace(st[1], env, out, depth)
+        if kind == "if":
+            self._sinks(st[1], env, out, depth)
+            known = self.ev.test(st[1], env)
+            if known is True:
+                return self._trace1(st[2], env, out, depth)
+            if known is False:
+                return self._trace1(st[3], env, out, depth) if st[3] else None
+            self._trace1(st[2], dict(env), out, depth)
+            if st[3]:
+                self._trace1(st[3], dict(env), out, depth)
+            return None
+        if kind == "switch":
+            self._sinks(st[1], env, out, depth)
+            value = self.ev._run_expr(st[1], env)
+            items = st[2]
+            if isinstance(value, str):
+                start = next((k for k, it in enumerate(items) if it[0] == "case"
+                              and str(self.ev._run_expr(it[1], env)).lower() == value.lower()), None)
+                if start is None:
+                    start = next((k for k, it in enumerate(items) if it[0] == "default"), None)
+                for it in items[start:] if start is not None else ():
+                    if it[0] in ("case", "default"):
+                        continue
+                    if it[0] == "break":
+                        break
+                    if self._trace1(it, env, out, depth) == "stop":
+                        return "stop"
+                return None
+            for it in items:                              # not known: every case
+                if it[0] not in ("case", "default", "break"):
+                    self._trace1(it, dict(env), out, depth)
+            return None
+        if kind == "loop":
+            self._trace1(st[1], dict(env), out, depth)
+            return None
+        if kind == "return":
+            self._sinks(st[1], env, out, depth)
+            return "stop"
+        if kind == "break":
+            return "stop"
+        if kind == "assign":
+            self._sinks(st[3], env, out, depth)
+            v = self.ev._run_expr(st[3], env)
+            if v is None or isinstance(v, bool) and st[2] == "+=":
+                env.pop(st[1], None)
+            else:
+                env[st[1]] = (str(env[st[1]]) + str(v)) if st[2] == "+=" and st[1] in env else v
+            return None
+        if kind == "expr":
+            self._sinks(st[1], env, out, depth)
+        return None
+
+
+def parse_description_hooks(text):
+    """A wrap of the game's SetDescriptionText that gives a mod's settings their descriptions
+    from its strings, as Better Candles does: [(string key prefix, lower-cased, section prefix or
+    '')]: GetLocStringByKeyExt("bettercandles_tip_" + StrLower(NameToString(optionName))), for the
+    sections whose name StrBeginsWith(…, "modbettercandles")."""
+    out = []
+    text = _ws_strip_comments(text)
+    for fn in re.finditer(r"@wrapMethod[^\n]*\n?\s*function\s+SetDescriptionText\s*\(", text):
+        body = _ws_body(text, fn.end())
+        group = re.search(r"StrBeginsWith\s*\(\s*\w+\s*,\s*" + _WS_STR, body)
+        for k in re.finditer(r"GetLocStringByKey(?:Ext)?\s*\(\s*" + _WS_STR + r"\s*\+\s*(StrLower\s*\()?\s*NameToString\s*\(\s*optionName",
+                             body):
+            out.append((_ws_unescape(k.group(1)), bool(k.group(2)), _ws_unescape(group.group(1)) if group else ""))
+    return out
+
+
+def parse_selection_help(text, more=""):
+    """A wrap of the game menu's OnOptionSelectionChanged that shows a note for the setting just
+    selected, from a function that names the note's string key for each setting, as Minimalist
+    Witcher Senses does: key = MwsHelpKey(optionName) … GetLocStringByKey(key), MwsHelpKey a switch
+    of case 'mws_KeepCameraStill': return "mws_KeepCameraStill_help"; … -> {setting id (lower):
+    string key}. more: the mod's other scripts, where that function may be. {} for anything else."""
+    text = _ws_strip_comments(text)
+    pool = text + "\n" + _ws_strip_comments(more) if more else text
+    out = {}
+    for fn in re.finditer(r"@wrapMethod[^\n]*\n?\s*function\s+OnOptionSelectionChanged\s*\(\s*(\w+)", text):
+        param = fn.group(1)
+        body = _ws_body(text, fn.end())
+        names = set()
+        for g in re.finditer(r"GetLocStringByKey(?:Ext)?\s*\(\s*(\w+)\s*(\(\s*" + re.escape(param) + r"\s*\))?\s*\)", body):
+            if g.group(2):
+                names.add(g.group(1))                  # GetLocStringByKey(F(optionName))
+            else:                                      # key = F(optionName); … GetLocStringByKey(key)
+                names.update(re.findall(r"\b" + re.escape(g.group(1)) + r"\s*=\s*(\w+)\s*\(\s*" + re.escape(param) + r"\s*\)", body))
+        for name in names:
+            f = re.search(r"\bfunction\s+" + re.escape(name) + r"\s*\(\s*(\w+)\s*:\s*name\s*\)", pool)
+            if not f:
+                continue
+            fbody = _ws_body(pool, f.end())
+            if not re.search(r"\bswitch\s*\(\s*" + re.escape(f.group(1)) + r"\s*\)", fbody):
+                continue
+            pending = []
+            for t in re.finditer(r"\bcase\s+'([^']*)'\s*:|\breturn\s+" + _WS_STR + r"\s*;|\bdefault\s*:|\bbreak\s*;", fbody):
+                if t.group(1) is not None:
+                    pending.append(t.group(1).lower())
+                elif t.group(2) is not None:
+                    for case in pending:
+                        if _ws_unescape(t.group(2)):
+                            out.setdefault(case, _ws_unescape(t.group(2)))
+                    pending = []
+                else:
+                    pending = []
+    return out
+
+
+_TC_INDEX = {}
+
+
+def texture_cache_index(path):
+    """{name: (page, width, height, format codes)} of what a texture.cache holds, by its name in
+    lower case ("gameplay\\gui_new\\icons\\inventory\\…\\x.png") and by what follows gui_new\\
+    (the path a menu's img://… names). Read once per change of the file: its 32-byte footer, the
+    entries (52 bytes each) and the names before them (as WolvenKit reads them)."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return {}
+    key = (str(path), st.st_size, st.st_mtime_ns)
+    if key in _TC_INDEX:
+        return _TC_INDEX[key]
+    out = {}
+    try:
+        with open(path, "rb") as f:
+            size = st.st_size
+            if size >= 32:
+                f.seek(size - 32)
+                foot = f.read(32)
+                _crc, _pages, count, names_size, _mips = struct.unpack_from("<QIIII", foot, 0)
+                start = size - 32 - count * 52 - names_size
+                if foot[24:28] == b"HCXT" and count and start >= 0:
+                    f.seek(start)
+                    names = f.read(names_size)
+                    table = f.read(count * 52)
+                    for k in range(count):
+                        (_h, at, page, _cs, _us, _al, w, h, _mc, _sc, _mo, _nm, _ts, t1, t2, _cube,
+                         _u) = struct.unpack_from("<IiIIIIHHHHiiqBBBB", table, 52 * k)
+                        end = names.find(b"\0", at)
+                        if at < 0 or end < 0:
+                            continue
+                        name = names[at:end].decode("utf-8", "replace").lower().replace("/", "\\")
+                        rec = (page, w, h, (t1, t2))
+                        out[name] = rec
+                        if "gui_new\\" in name:
+                            out.setdefault(name.split("gui_new\\", 1)[1], rec)
+    except (OSError, struct.error):
+        out = {}
+    _TC_INDEX[key] = out
+    return out
+
+
+def _bc_colours(c0, c1, four):
+    def rgb(c):
+        return ((c >> 11 & 31) * 255 // 31, (c >> 5 & 63) * 255 // 63, (c & 31) * 255 // 31)
+    a, b = rgb(c0), rgb(c1)
+    if four:
+        return [a + (255,), b + (255,), tuple((2 * x + y) // 3 for x, y in zip(a, b)) + (255,),
+                tuple((x + 2 * y) // 3 for x, y in zip(a, b)) + (255,)]
+    return [a + (255,), b + (255,), tuple((x + y) // 2 for x, y in zip(a, b)) + (255,), (0, 0, 0, 0)]
+
+
+def decode_bc(data, w, h, kind):
+    """RGBA bytes of a block-compressed texture: kind 1 (DXT1/BC1, 8 bytes a 4x4 block) or 3
+    (DXT5/BC3, 16 bytes: alpha then colour)."""
+    out = bytearray(w * h * 4)
+    step = 8 if kind == 1 else 16
+    i = 0
+    for by in range(0, h, 4):
+        for bx in range(0, w, 4):
+            if kind == 3:
+                a0, a1 = data[i], data[i + 1]
+                abits = int.from_bytes(data[i + 2:i + 8], "little")
+                alpha = [a0, a1] + ([(a0 * (7 - k) + a1 * k) // 7 for k in range(1, 7)] if a0 > a1
+                                    else [(a0 * (5 - k) + a1 * k) // 5 for k in range(1, 5)] + [0, 255])
+                c = i + 8
+            else:
+                c = i
+            c0, c1, bits = struct.unpack_from("<HHI", data, c)
+            cols = _bc_colours(c0, c1, kind == 3 or c0 > c1)
+            for k in range(16):
+                px, py = bx + (k & 3), by + (k >> 2)
+                if px < w and py < h:
+                    r, g, b, a = cols[(bits >> (2 * k)) & 3]
+                    if kind == 3:
+                        a = alpha[(abits >> (3 * k)) & 7]
+                    o = (py * w + px) * 4
+                    out[o:o + 4] = bytes((r, g, b, a))
+            i += step
+    return bytes(out)
+
+
+def texture_cache_rgba(path, rec):
+    """(width, height, RGBA bytes) of one texture in a texture.cache, its largest size, or None.
+    Its data starts at its page (4096 bytes each): compressed size, size, a part number, then
+    zlib. The format is told by the size against the picture's: half a byte a pixel DXT1, one
+    DXT5, four plain colours (stored blue, green, red, alpha). Icons only (up to 512 x 512)."""
+    page, w, h, _codes = rec
+    if not w or not h or w * h > 512 * 512:
+        return None
+    try:
+        with open(path, "rb") as f:
+            f.seek(page * 4096)
+            head = f.read(9)
+            zsize, size = struct.unpack_from("<II", head, 0)
+            if zsize > 64 << 20 or size > 64 << 20:
+                return None
+            raw = zlib.decompress(f.read(zsize))
+    except (OSError, struct.error, zlib.error):
+        return None
+    base = w * h
+    bw, bh = (w + 3) // 4 * 4, (h + 3) // 4 * 4
+    if base * 4 <= len(raw) < base * 6:
+        px = raw[:base * 4]
+        return w, h, b"".join(px[k + 2:k + 3] + px[k + 1:k + 2] + px[k:k + 1] + px[k + 3:k + 4] for k in range(0, len(px), 4))
+    if bw * bh <= len(raw) < bw * bh * 2:
+        return w, h, decode_bc(raw, w, h, 3)
+    if bw * bh // 2 <= len(raw) < bw * bh:
+        return w, h, decode_bc(raw, w, h, 1)
+    return None
+
+
+def _luminance(c):
+    def ch(v):
+        v /= 255
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+    return 0.2126 * ch(c.red()) + 0.7152 * ch(c.green()) + 0.0722 * ch(c.blue())
+
+
+def readable_colour(colour, on):
+    """A text colour a mod picked for the game's screen, lifted toward white just enough to read
+    on the app's darker card (contrast 4.5:1); its hue kept. One that reads already is unchanged."""
+    c, bg = QColor(colour), QColor(on)
+    if not c.isValid():
+        return colour
+    lb = _luminance(bg)
+    ratio = lambda x: (max(_luminance(x), lb) + 0.05) / (min(_luminance(x), lb) + 0.05)
+    if ratio(c) >= 4.5:
+        return colour
+    for k in range(1, 21):
+        t = k / 20
+        m = QColor(round(c.red() + (255 - c.red()) * t), round(c.green() + (255 - c.green()) * t),
+                   round(c.blue() + (255 - c.blue()) * t))
+        if ratio(m) >= 4.5:
+            return m.name()
+    return "#ffffff"
+
+
+def menu_image_rows(text):
+    """A description that's only rows of pictures under short headings ("Vanilla:", three icons;
+    "Tiered:", three icons, as Rational Inventory Icons shows its choices) laid out with each
+    heading beside its pictures, not over them: half the height, the card no taller than it needs
+    (Remos, 30 Oct: "too much wasted space"). Any other description as it is."""
+    lines = [l for l in re.split(r"<br\s*/?>", text, flags=re.I)]
+    pairs, i = [], 0
+    while i < len(lines):
+        head = lines[i].strip()
+        if not head:
+            i += 1
+            continue
+        if re.search(r"<img\b", head, re.I) or len(re.sub(r"<[^>]+>", "", head)) > 40 or not head.rstrip().endswith(":"):
+            return text                            # not a heading: some other description
+        imgs = lines[i + 1].strip() if i + 1 < len(lines) else ""
+        if imgs and not re.fullmatch(r"(\s*<img\b[^>]*>\s*)+", imgs, re.I):
+            imgs = None
+        if imgs is None:
+            return text
+        pairs.append((head, imgs))
+        i += 2
+    if not pairs or not any(imgs for _h, imgs in pairs):
+        return text
+    rows = "".join(f'<tr><td style="padding: 0 14px 6px 0; vertical-align: middle;">{h}</td>'
+                   f'<td style="padding: 0 0 6px 0; vertical-align: middle;">{imgs}</td></tr>' for h, imgs in pairs)
+    return f'<table cellspacing="0" cellpadding="0">{rows}</table>'
+
+
+def menu_rich(text, image=None):
+    """A description as the game's menu shows it, for a Qt label: its own markup kept (<font
+    color>, <br>, <i>, <b>); an image it names (img://icons/…png) drawn from the game's or a mod's
+    texture.cache through image(src) -> (file, width, height), else left out."""
+    def img(m):
+        src = re.search(r"""src\s*=\s*["']([^"']+)["']""", m.group(0), re.I)
+        got = image(src.group(1)) if (image and src) else None
+        if not got:
+            return ""
+        size = {k.lower(): v for k, v in re.findall(r"""(width|height)\s*=\s*["']?(\d+)""", m.group(0), re.I)}
+        return (f'<img src="{html.escape(str(got[0]))}" width="{size.get("width", got[1])}" '
+                f'height="{size.get("height", got[2])}">')
+    text = re.sub(r"<\s*img\b[^>]*>", img, text or "", flags=re.I)
+    if not re.search(r"</?(font|br|i|b|u|p)(\s[^<>]*)?/?>", text, re.I):     # whole tags only: "a < b" is text
+        text = html.escape(text).replace("\n", "<br>")
+    elif "<img" in text:
+        text = menu_image_rows(text)
+    # a colour too dark for the description card (Brothers In Arms' deep blue) made readable
+    text = re.sub(r"""(<font\b[^>]*?\bcolor\s*=\s*)(["']?)(#[0-9a-fA-F]{3,8}|[a-zA-Z]+)\2""",
+                  lambda m: f'{m.group(1)}"{readable_colour(m.group(3), C["well"])}"', text, flags=re.I)
+    return text.strip()
+
+
+def menu_same(a, b):
+    """Two menu values the game takes the same way: true/True, 6/6.0, ' 1'/'1'."""
+    a, b = str(a if a is not None else "").strip(), str(b if b is not None else "").strip()
+    if a.lower() == b.lower():
+        return True
+    try:
+        return abs(float(a) - float(b)) < 1e-9
+    except ValueError:
+        return False
+
+
+def str_key_hash(key):
+    """The hash a .w3strings file keeps a string's key as ("option_bettercandles_enable"): the key in
+    lower case, each character's code added to 31 times the hash so far, 32 bits."""
+    h = 0
+    for ch in key.lower():
+        h = (h * 31 + ord(ch)) & 0xFFFFFFFF
+    return h
 
 
 def w3strings_format(data):
@@ -3432,7 +4776,8 @@ def _rsb_int(d, p):
 def rsblob_read(data):
     """What a precompiled.rsblob (REDkit 5's compiled scripts) declares, read from its tables:
     {'enums', 'types' (classes, structs, enums), 'states': [(machine, name)], 'functions',
-    'replace_method', 'add_method', 'wrap_method', 'add_field': [(class, name)]}, names as
+    'replace_method', 'add_method', 'wrap_method', 'add_field': [(class, name)], 'parents':
+    [(class, its parent)], 'class_funcs': {class or state: [its functions]}}, names as
     written. Raises ValueError for anything that doesn't read cleanly.
     Layout (worked out on ten mods' files, REDkit builds 1042178, 1044630 and 1048625, checked
     against one's published source): a version (1), platform, build, 8 bytes, configuration;
@@ -3532,7 +4877,7 @@ def rsblob_read(data):
         p += 8
         _t, p = text(p)                              # configuration ("Release")
         out = {"enums": [], "types": [], "states": [], "functions": [], "replace_method": [],
-               "add_method": [], "wrap_method": [], "add_field": []}
+               "add_method": [], "wrap_method": [], "add_field": [], "parents": [], "class_funcs": {}}
         n, p = num(p)
         for _ in range(n):                           # enums: name, then (value name, value)
             nm, p = name(p)
@@ -3552,17 +4897,20 @@ def rsblob_read(data):
         n, p = num(p)
         for _ in range(n):                           # classes, and states (in their state machine)
             nm, p = name(p)
-            _parent, p = name(p)
+            parent, p = name(p)
             machine, p = name(p)
             for _k in range(2):
                 _v, p = num(p)
             _f, p = props(p)
-            _m, p = funcs(p)
+            fns, p = funcs(p)
             p = defaults(p)
+            out["class_funcs"].setdefault(nm, []).extend(f for _o, f in fns)
             if machine:
                 out["states"].append((machine, nm))
             else:
                 out["types"].append(nm)
+                if parent:
+                    out["parents"].append((nm, parent))
         glob, p = funcs(p)
         out["functions"] = [nm for _o, nm in glob]
         _u, p = funcs(p)                             # empty in every file seen
@@ -3577,13 +4925,16 @@ def rsblob_read(data):
 
 _RSB_CACHE = {}
 _CHANGED_CACHE = {}    # ModManager._changed_game_functions, by both files' size and time
-RSB_KEPT = "rsb2"      # what rsblob_symbols keeps in scans.json (2: @replaceMethod, enums)
+RSB_KEPT = "rsb4"      # what rsblob_symbols keeps in scans.json (2: @replaceMethod, enums; 3: @wrapMethod, parents; 4: class functions)
 
 
 def rsblob_symbols(path):
     """{(kind, class, name): 'Class.Name' as written} for what a precompiled.rsblob declares
     that only one mod may: @replaceMethod / @addMethod / @addField on a class ('@replacemethod',
-    '@addmethod', '@addfield'), classes, structs and enums ('type'), states ('state') and global functions ('function'). The
+    '@addmethod', '@addfield'), what it wraps ('@wrapmethod', which several mods may), classes,
+    structs and enums ('type'), states ('state'), global functions ('function'), each class's
+    parent ('extends', class, parent: shown is the parent as written) and each class's functions
+    ('classfn': for one of the game's own classes declared again, they take the game's place). The
     same keys as _annotated_symbols, so loose scripts and precompiled ones are checked
     together. {} when it can't be read. Remembered like _annotated_symbols."""
     try:
@@ -3611,6 +4962,15 @@ def rsblob_symbols(path):
             out[("@addmethod", cls.lower(), nm.lower())] = f"{cls}.{nm}"
         for cls, nm in got["add_field"]:
             out[("@addfield", cls.lower(), nm.lower())] = f"{cls}.{nm}"
+        for cls, nm in got["wrap_method"]:
+            out[("@wrapmethod", cls.lower(), nm.lower())] = f"{cls}.{nm}"
+        for nm, parent in got["parents"]:
+            out[("extends", nm.lower(), parent.lower())] = parent
+        states = {st for _m, st in got["states"]}
+        for nm, fns in got["class_funcs"].items():
+            if nm not in states:
+                for fn in fns:
+                    out[("classfn", nm.lower(), fn.lower())] = f"{nm}.{fn}"
         for nm in got["types"]:
             out[("type", "", nm.lower())] = nm
         for machine, nm in got["states"]:
@@ -3622,6 +4982,1126 @@ def rsblob_symbols(path):
     _RSB_CACHE[sig] = out
     KEPT.put(RSB_KEPT, str(path), st, [[list(k), shown] for k, shown in out.items()])
     return out
+
+
+# --- precompiled.rsblob back to WitcherScript (decompiler) -------------------------------------
+# Ported to Python from W3 Mod Workbench's ScriptBlob, Bytecode, Decompiler, Operators, EnumResolver
+# and ScriptWriter (https://github.com/Faen668/W3ModWorkbench), which say: the operator table and
+# its order come from Aelto's tw3-cahirb project. Their licence:
+#
+#   MIT License
+#
+#   Copyright (c) 2026 Faen90
+#
+#   Permission is hereby granted, free of charge, to any person obtaining a copy of this software
+#   and associated documentation files (the "Software"), to deal in the Software without
+#   restriction, including without limitation the rights to use, copy, modify, merge, publish,
+#   distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the
+#   Software is furnished to do so, subject to the following conditions:
+#
+#   The above copyright notice and this permission notice shall be included in all copies or
+#   substantial portions of the Software.
+#
+#   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
+#   BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+#   NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+#   DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+#   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+class _BlobReader:
+    """The blob's numbers (CR2W style: sign bit, 'more' bit, 6 bits, then 7-bit groups), texts and names."""
+    __slots__ = ("d", "p", "names")
+
+    def __init__(self, data, pos, names=()):
+        self.d, self.p, self.names = data, pos, names
+
+    def u8(self):
+        b = self.d[self.p]
+        self.p += 1
+        return b
+
+    def u32(self):
+        v = struct.unpack_from("<i", self.d, self.p)[0]
+        self.p += 4
+        return v
+
+    def vlq(self):
+        b = self.d[self.p]
+        self.p += 1
+        neg, v = b & 0x80, b & 0x3F
+        if b & 0x40:
+            shift = 6
+            while True:
+                b = self.d[self.p]
+                self.p += 1
+                v |= (b & 0x7F) << shift
+                shift += 7
+                if not b & 0x80:
+                    break
+        return -v if neg else v
+
+    def text(self):
+        n = abs(self.vlq())
+        s = bytes(self.d[self.p:self.p + n]).decode("utf-8", "replace")
+        if self.p + n > len(self.d):
+            raise IndexError("text past the end")
+        self.p += n
+        return s
+
+    def name(self):
+        i = self.vlq()
+        return self.names[i] if 0 <= i < len(self.names) else f"<name{i}>"
+
+
+def rsblob_parse(data):
+    """A precompiled.rsblob in full, for the decompiler: {'build', 'configuration', 'platform',
+    'enums': [(name, [(member, value)])], 'structs', 'classes' (with 'is_state', 'state_of', 'base',
+    'props', 'funcs', 'defaults'), 'globals', 'replaced_globals', 'replaced', 'added', 'wrapped'
+    (functions: name, owner, flags, ret, params, locals, runtime, code, kind, cls), 'added_fields',
+    'types': [(name, kind)], 'func_refs': [(name, owner type)], 'names'}. Raises ValueError."""
+    d = bytes(data)
+    try:
+        if len(d) < 16:
+            raise ValueError("too small for a compiled script file")
+        table = struct.unpack_from("<i", d, len(d) - 4)[0]
+        if not 0 < table < len(d) - 4:
+            raise ValueError("not a compiled script file")
+        nr = _BlobReader(d, table)
+        names = [nr.text() for _ in range(nr.u32())]
+        r = _BlobReader(d, 0, names)
+        if r.u32() != 1:
+            raise ValueError("a compiled script version this doesn't know")
+        out = {"platform": r.text(), "build": r.text()}
+        r.p += 8
+        out["configuration"] = r.text()
+
+        def props():
+            lst = []
+            for _ in range(r.vlq()):
+                nm, hint, flags = r.name(), r.text(), r.vlq()
+                typ, owner = r.name(), r.name()
+                r.name()                                 # empty in every blob seen
+                lst.append({"name": nm, "hint": hint, "flags": flags, "type": typ, "owner": owner})
+            return lst
+
+        def node():
+            key, value = r.name(), r.text()
+            return (key, value, [node() for _ in range(r.vlq())])
+
+        def defaults():
+            lst = []
+            for _ in range(r.vlq()):
+                prop = r.name()
+                key, value, kids = node()
+                lst.append((prop, value, kids))
+            return lst
+
+        def function(kind, cls):
+            nm, owner, flags = r.name(), r.name(), r.vlq()
+            ret, params, local = props(), props(), props()
+            length = r.vlq()
+            if length < 4:                               # no code at all (never seen in a real file)
+                r.p += max(length, 0)
+                code, runtime = b"", 0
+            else:
+                runtime = r.u32()
+                length -= 4
+                if r.p + length > len(d):
+                    raise ValueError("code past the end")
+                code = d[r.p:r.p + length]
+                r.p += length
+            return {"name": nm, "owner": owner, "flags": flags, "ret": ret, "params": params, "locals": local,
+                    "runtime": runtime, "code": code, "kind": kind, "cls": cls}
+
+        out["enums"] = []
+        for _ in range(r.vlq()):
+            nm = r.name()
+            out["enums"].append((nm, [(r.name(), r.vlq()) for _m in range(r.vlq())]))
+        out["structs"] = []
+        for _ in range(r.vlq()):
+            nm, flags = r.name(), r.vlq()
+            out["structs"].append({"name": nm, "flags": flags, "props": props(), "defaults": defaults()})
+        out["classes"] = []
+        for _ in range(r.vlq()):
+            c = {"name": r.name(), "base": r.name(), "state_of": r.name(), "is_state": r.u8() != 0, "flags": r.vlq()}
+            c["props"] = props()
+            c["funcs"] = [function("method", c) for _f in range(r.vlq())]
+            c["defaults"] = defaults()
+            out["classes"].append(c)
+        for key, kind in (("globals", "global"), ("replaced_globals", "replace_global"), ("replaced", "replace"),
+                          ("added", "add"), ("wrapped", "wrap")):
+            out[key] = [function(kind, None) for _ in range(r.vlq())]
+        out["added_fields"] = props()
+        out["types"] = [(r.name(), r.vlq()) for _ in range(r.vlq())]
+        out["imported_props"] = [(r.name(), r.vlq(), r.vlq()) for _ in range(r.vlq())]
+        out["func_refs"] = [(r.name(), r.vlq()) for _ in range(r.vlq())]
+        if r.p != table:
+            raise ValueError("didn't read to the name table")
+        out["names"] = names
+        return out
+    except (IndexError, struct.error) as e:
+        raise ValueError(f"damaged compiled script file ({e})") from None
+
+
+# the engine's instructions
+_OP = dict(Nop=0x00, Null=0x01, IntOne=0x02, IntZero=0x03, IntConst=0x04, ShortConst=0x05, FloatConst=0x06,
+           StringConst=0x07, NameConst=0x08, ByteConst=0x09, BoolTrue=0x0A, BoolFalse=0x0B, Line=0x0C, Assign=0x0D,
+           Target=0x0E, LocalVar=0x0F, ParamVar=0x10, ObjectVar=0x11, BindableVar=0x12, DefaultVar=0x13, Switch=0x14,
+           SwitchLabel=0x15, SwitchDefault=0x16, Jump=0x17, JumpIfFalse=0x18, Skip=0x19, Conditional=0x1A,
+           Constructor=0x1B, FinalFunc=0x1C, VirtualFunc=0x1D, VirtualParentFunc=0x1E, EntryFunc=0x1F, ParamEnd=0x20,
+           Return=0x21, StructMember=0x22, Context=0x23, TestEqual=0x24, TestNotEqual=0x25, New=0x26, Delete=0x27,
+           This=0x28, Parent=0x29, SavePoint=0x2A, SaveValue=0x2B, SavePointEnd=0x2C, ArrayClear=0x2D, ArraySize=0x2E,
+           ArrayResize=0x2F, ArrayFindFirst=0x30, ArrayFindFirstFast=0x31, ArrayFindLast=0x32, ArrayFindLastFast=0x33,
+           ArrayContains=0x34, ArrayContainsFast=0x35, ArrayPushBack=0x36, ArrayPopBack=0x37, ArrayInsert=0x38,
+           ArrayRemove=0x39, ArrayRemoveFast=0x3A, ArrayGrow=0x3B, ArrayErase=0x3C, ArrayEraseFast=0x3D,
+           ArrayLast=0x3E, ArrayElement=0x3F, StaticArraySize=0x40, StaticArrayFindFirst=0x41,
+           StaticArrayFindFirstFast=0x42, StaticArrayFindLast=0x43, StaticArrayFindLastFast=0x44,
+           StaticArrayContains=0x45, StaticArrayContainsFast=0x46, StaticArrayLast=0x47, StaticArrayElement=0x48,
+           BoolToByte=0x49, BoolToInt=0x4A, BoolToFloat=0x4B, BoolToString=0x4C, ByteToBool=0x4D, ByteToInt=0x4E,
+           ByteToFloat=0x4F, ByteToString=0x50, IntToBool=0x51, IntToByte=0x52, IntToFloat=0x53, IntToString=0x54,
+           IntToEnum=0x55, FloatToBool=0x56, FloatToByte=0x57, FloatToInt=0x58, FloatToString=0x59, NameToBool=0x5A,
+           NameToString=0x5B, StringToBool=0x5C, StringToByte=0x5D, StringToInt=0x5E, StringToFloat=0x5F,
+           ObjectToBool=0x60, ObjectToString=0x61, EnumToString=0x62, EnumToInt=0x63, DynamicCast=0x64, TheGame=0x65,
+           ThePlayer=0x66, TheCamera=0x67, TheHud=0x68, TheSound=0x69, TheDebug=0x6A, TheTimer=0x6B, TheInput=0x6C,
+           TheTelemetry=0x6D, MapClear=0x6E, MapSize=0x6F, MapContains=0x70, MapErase=0x71, MapElement=0x72, MapKey=0x74)
+_OPN = {v: k for k, v in _OP.items()}
+# operands: v number, n name, t type, f function (index + 1, or an operator when <= 0), h signed
+# 16-bit offset, b byte, F float, s text
+_OPERANDS = {"IntConst": "v", "ShortConst": "h", "FloatConst": "F", "StringConst": "s", "NameConst": "n",
+             "ByteConst": "b", "Line": "vb", "LocalVar": "n", "ParamVar": "n", "ObjectVar": "nt", "BindableVar": "nt",
+             "DefaultVar": "nt", "Switch": "th", "SwitchLabel": "hh", "Jump": "h", "JumpIfFalse": "h", "Skip": "h",
+             "Conditional": "hh", "Constructor": "vt", "FinalFunc": "hhf", "VirtualFunc": "hhn",
+             "VirtualParentFunc": "hhn", "EntryFunc": "hn", "StructMember": "nt", "Context": "h", "TestEqual": "t",
+             "TestNotEqual": "t", "New": "t", "SavePoint": "hn", "SaveValue": "n", "IntToEnum": "t",
+             "EnumToString": "t", "EnumToInt": "t", "DynamicCast": "t"}
+for _o in range(_OP["ArrayClear"], _OP["ArrayElement"] + 1):
+    _OPERANDS[_OPN[_o]] = "t"
+for _o in ("MapClear", "MapSize", "MapContains", "MapErase", "MapElement", "MapKey"):
+    _OPERANDS[_o] = "t"
+# in-memory operand sizes that differ from the defaults (names 4, types 8, functions 8, numbers 4)
+_RT_SIZES = {("ObjectVar", 0): 8, ("ObjectVar", 1): 0, ("BindableVar", 0): 8, ("BindableVar", 1): 0,
+             ("DefaultVar", 0): 8, ("DefaultVar", 1): 0, ("StructMember", 0): 8, ("StructMember", 1): 0,
+             ("LocalVar", 0): 8, ("ParamVar", 0): 8, ("Constructor", 0): 1}
+
+
+class _Ins:
+    __slots__ = ("op", "rt", "rt_end", "args", "text", "f")
+
+    def __init__(self, op, rt, rt_end, args, text, f):
+        self.op, self.rt, self.rt_end, self.args, self.text, self.f = op, rt, rt_end, args, text, f
+
+    @property
+    def jump_target(self):
+        return self.rt + 3 + self.args[0]
+
+
+def rsblob_decode(code):
+    """A function's code as instructions. Raises ValueError on an instruction this doesn't know."""
+    out, p, rt = [], 0, 0
+    r = _BlobReader(code, 0)
+    while p < len(code):
+        raw = code[p]
+        p += 1
+        op = _OPN.get(raw)
+        if op is None:
+            raise ValueError(f"unknown instruction 0x{raw:02X} at byte {p - 1}")
+        fmt = _OPERANDS.get(op, "")
+        args, text, f, size = [], None, 0.0, 1
+        for k, c in enumerate(fmt):
+            if c in "vntf":
+                r.p = p
+                args.append(r.vlq())
+                p = r.p
+                osize = 4 if c in "nv" else 8
+            elif c == "h":
+                args.append(struct.unpack_from("<h", code, p)[0])
+                p += 2
+                osize = 2
+            elif c == "b":
+                args.append(code[p])
+                p += 1
+                osize = 1
+            elif c == "F":
+                f = struct.unpack_from("<f", code, p)[0]
+                p += 4
+                osize = 4
+            else:
+                r.p = p
+                n = abs(r.vlq())
+                p = r.p
+                text = bytes(code[p:p + n]).decode("utf-8", "replace")
+                p += n
+                osize = 4 + n
+            size += _RT_SIZES.get((op, k), osize)
+        out.append(_Ins(op, rt, rt + size, args, text, f))
+        rt += size
+    return out
+
+
+# the engine's built-in operators: id -2 is the first, -3 the second… (-1 calls a wrapped original)
+_OPERATORS = (
+    "Add_Int32_Int32 Subtract_Int32_Int32 Multiply_Int32_Int32 Divide_Int32_Int32 Modulo_Int32_Int32 Neg_Int32 "
+    "BitNot_Int32 And_Int32_Int32 Or_Int32_Int32 Xor_Int32_Int32 Equal_Int32_Int32 NotEqual_Int32_Int32 "
+    "Less_Int32_Int32 LessEqual_Int32_Int32 Greater_Int32_Int32 GreaterEqual_Int32_Int32 AssignAdd_Int32_Int32 "
+    "AssignSubtract_Int32_Int32 AssignMultiply_Int32_Int32 AssignDivide_Int32_Int32 AssignAnd_Int32_Int32 "
+    "AssignOr_Int32_Int32 Add_Uint64_Uint64 Subtract_Uint64_Uint64 Multiply_Uint64_Uint64 Divide_Uint64_Uint64 "
+    "Modulo_Uint64_Uint64 And_Uint64_Uint64 Or_Uint64_Uint64 Xor_Uint64_Uint64 Equal_Uint64_Uint64 "
+    "NotEqual_Uint64_Uint64 Less_Uint64_Uint64 LessEqual_Uint64_Uint64 Greater_Uint64_Uint64 "
+    "GreaterEqual_Uint64_Uint64 AssignAdd_Uint64_Uint64 AssignSubtract_Uint64_Uint64 AssignMultiply_Uint64_Uint64 "
+    "AssignDivide_Uint64_Uint64 AssignAnd_Uint64_Uint64 AssignOr_Uint64_Uint64 Add_String_String "
+    "AssignAdd_String_String Add_Float_Float Subtract_Float_Float Multiply_Float_Float Divide_Float_Float "
+    "Modulo_Float_Float Neg_Float Equal_Float_Float NotEqual_Float_Float Less_Float_Float LessEqual_Float_Float "
+    "Greater_Float_Float GreaterEqual_Float_Float AssignAdd_Float_Float AssignSubtract_Float_Float "
+    "AssignMultiply_Float_Float AssignDivide_Float_Float Add_Uint8_Int32 Subtract_Uint8_Int32 Multiply_Uint8_Int32 "
+    "Divide_Uint8_Int32 Modulo_Uint8_Int32 And_Uint8_Int32 Or_Uint8_Int32 Xor_Uint8_Int32 Equal_Uint8_Uint8 "
+    "NotEqual_Uint8_Uint8 Less_Uint8_Uint8 LessEqual_Uint8_Uint8 Greater_Uint8_Uint8 GreaterEqual_Uint8_Int32 "
+    "AssignAdd_Uint8_Int32 AssignSubtract_Uint8_Int32 AssignMultiply_Uint8_Int32 AssignDivide_Uint8_Int32 "
+    "AssignAnd_Uint8_Int32 AssignOr_Uint8_Int32 LogicAnd_Bool_Bool LogicOr_Bool_Bool LogicNot_Bool Neg_Vector "
+    "Add_Vector_Vector Subtract_Vector_Vector Multiply_Vector_Vector Divide_Vector_Vector AssignAdd_Vector_Vector "
+    "AssignSubtract_Vector_Vector AssignMultiply_Vector_Vector AssignDivide_Vector_Vector Add_Vector_Float "
+    "Subtract_Vector_Float Multiply_Vector_Float Divide_Vector_Float AssignAdd_Vector_Float AssignSubtract_Vector_Float "
+    "AssignMultiply_Vector_Float AssignDivide_Vector_Float Multiply_Float_Vector Multiply_Matrix_Matrix "
+    "AssignMultiply_Matrix_Matrix Add_EngineTime_EngineTime Add_EngineTime_Float AssignAdd_EngineTime_EngineTime "
+    "AssignAdd_EngineTime_Float Subtract_EngineTime_EngineTime Subtract_EngineTime_Float "
+    "AssignSubtract_EngineTime_EngineTime AssignSubtract_EngineTime_Float Multiply_EngineTime_Float "
+    "AssignMultiply_EngineTime_Float Divide_EngineTime_Float AssignDivide_EngineTime_Float Modulo_EngineTime_Float "
+    "Equal_EngineTime_EngineTime NotEqual_EngineTime_EngineTime Greater_EngineTime_EngineTime "
+    "GreaterEqual_EngineTime_EngineTime Less_EngineTime_EngineTime LessEqual_EngineTime_EngineTime "
+    "Greater_EngineTime_Float GreaterEqual_EngineTime_Float Less_EngineTime_Float LessEqual_EngineTime_Float "
+    "LogicAnd_handle_IScriptable_handle_IScriptable Add_GameTime_GameTime Add_GameTime_Int32 "
+    "Subtract_GameTime_GameTime Subtract_GameTime_Int32 Multiply_GameTime_Float Divide_GameTime_Float Neg_GameTime "
+    "Equal_GameTime_GameTime NotEqual_GameTime_GameTime Less_GameTime_GameTime LessEqual_GameTime_GameTime "
+    "Greater_GameTime_GameTime GreaterEqual_GameTime_GameTime AssignAdd_GameTime_GameTime "
+    "AssignSubtract_GameTime_GameTime AssignAdd_GameTime_Int32 AssignSubtract_GameTime_Int32 "
+    "AssignMultiply_GameTime_Float AssignDivide_GameTime_Float Equal_SItemUniqueId_SItemUniqueId "
+    "NotEqual_SItemUniqueId_SItemUniqueId Add_SAbilityAttributeValue_SAbilityAttributeValue "
+    "Subtract_SAbilityAttributeValue_SAbilityAttributeValue AssignAdd_SAbilityAttributeValue_SAbilityAttributeValue "
+    "AssignSubtract_SAbilityAttributeValue_SAbilityAttributeValue Multiply_SAbilityAttributeValue_Float").split()
+_P_ASSIGN, _P_OR, _P_AND, _P_BITOR, _P_BITXOR, _P_BITAND, _P_EQ, _P_REL, _P_ADD, _P_MUL, _P_UNARY, _P_PRIMARY = \
+    10, 20, 30, 43, 44, 45, 50, 60, 70, 80, 90, 100
+_OP_KINDS = {"Add": ("+", _P_ADD), "Subtract": ("-", _P_ADD), "Multiply": ("*", _P_MUL), "Divide": ("/", _P_MUL),
+             "Modulo": ("%", _P_MUL), "Neg": ("-", _P_UNARY), "BitNot": ("~", _P_UNARY), "And": ("&", _P_BITAND),
+             "Or": ("|", _P_BITOR), "Xor": ("^", _P_BITXOR), "Equal": ("==", _P_EQ), "NotEqual": ("!=", _P_EQ),
+             "Less": ("<", _P_REL), "LessEqual": ("<=", _P_REL), "Greater": (">", _P_REL),
+             "GreaterEqual": (">=", _P_REL), "AssignAdd": ("+=", _P_ASSIGN), "AssignSubtract": ("-=", _P_ASSIGN),
+             "AssignMultiply": ("*=", _P_ASSIGN), "AssignDivide": ("/=", _P_ASSIGN), "AssignAnd": ("&=", _P_ASSIGN),
+             "AssignOr": ("|=", _P_ASSIGN), "LogicAnd": ("&&", _P_AND), "LogicOr": ("||", _P_OR),
+             "LogicNot": ("!", _P_UNARY)}
+
+
+def _operator(op_id):
+    """(symbol, precedence) for an operator id, or None; and its engine name."""
+    i = -op_id - 2
+    name = _OPERATORS[i] if 0 <= i < len(_OPERATORS) else f"operator{-op_id}"
+    return _OP_KINDS.get(name.split("_", 1)[0]) if 0 <= i < len(_OPERATORS) else None, name
+
+
+class _Expr:
+    __slots__ = ("text", "prec", "enum_type", "type", "inner", "literal")
+
+    def __init__(self, text, prec, enum_type=None, type=None, inner=None, literal=None):
+        self.text, self.prec, self.enum_type, self.type, self.inner, self.literal = \
+            text, prec, enum_type, type, inner, literal
+
+    def with_(self, **kw):
+        e = _Expr(self.text, self.prec, self.enum_type, self.type, self.inner, self.literal)
+        for k, v in kw.items():
+            setattr(e, k, v)
+        return e
+
+
+_EMPTY = _Expr("", _P_PRIMARY)
+_SIMPLE_OPS = {"Null": "NULL", "BoolTrue": "true", "BoolFalse": "false", "This": "this", "TheGame": "theGame",
+               "ThePlayer": "thePlayer", "TheCamera": "theCamera", "TheSound": "theSound", "TheDebug": "theDebug",
+               "TheTimer": "theTimer", "TheInput": "theInput", "TheTelemetry": "theTelemetry", "TheHud": "theHud"}
+
+
+def _fmt_float(f):
+    """A float as WitcherScript writes it: the shortest digits that read back as the same float."""
+    if f != f or f in (float("inf"), float("-inf")):
+        return str(f)
+    for p in range(1, 10):
+        s = f"{f:.{p}g}"
+        if struct.unpack("<f", struct.pack("<f", float(s)))[0] == f:
+            break
+    if "e" in s:
+        mant, ex = s.split("e")
+        s = f"{mant}E{int(ex)}"
+    elif "." not in s:
+        s += ".0"
+    return s
+
+
+def _quote(s):
+    return '"' + "".join({'"': '\\"', "\\": "\\\\", "\n": "\\n", "\r": "\\r", "\t": "\\t"}.get(c, c) for c in s) + '"'
+
+
+def _ws_type(t):
+    """An engine type name as WitcherScript writes it: Int32 -> int, array:2,0,Float -> array<float>…"""
+    def parse(t, at):
+        mp = t.startswith("map:", at)
+        if mp or t.startswith("array:", at):
+            at += 4 if mp else 6
+            for _n in range(2):
+                at = t.find(",", at) + 1
+            if not mp:
+                inner, at = parse(t, at)
+                return f"array<{inner}>", at
+            key, at = parse(t, at)
+            val, at = parse(t, at)
+            return f"map<{key}, {val}>", at
+        end = t.find(",", at)
+        end = len(t) if end < 0 else end
+        return _ws_type(t[at:end]), min(end + 1, len(t))
+    if t.startswith("map:"):
+        return parse(t, 0)[0]
+    if t.startswith("array:"):
+        comma = t.find(",", t.find(",") + 1)
+        return f"array<{_ws_type(t[comma + 1:] if comma > 0 else t[6:])}>"
+    for prefix in ("handle:", "ptr:", "soft:"):
+        if t.startswith(prefix):
+            return _ws_type(t[len(prefix):])
+    return {"Int32": "int", "Float": "float", "Bool": "bool", "String": "string", "CName": "name", "Uint8": "byte"}.get(t, t)
+
+
+_VANILLA_ENUMS = {}
+_ENUM_DECL_RE = re.compile(r"\benum\s+(\w+)\s*\{([^}]*)\}")
+
+
+def _vanilla_enums(scripts_dir):
+    """{enum: {value: member}} from the game's own scripts, read once per session."""
+    key = str(scripts_dir or "")
+    hit = _VANILLA_ENUMS.get(key)
+    if hit is None:
+        hit = {}
+        if scripts_dir and Path(scripts_dir).is_dir():
+            for dp, _dn, files in os.walk(scripts_dir):
+                for f in files:
+                    if f.lower().endswith(".ws"):
+                        for m in _ENUM_DECL_RE.finditer(_script_text(Path(dp, f))):
+                            vals, nxt = {}, 0
+                            for raw in m.group(2).split(","):
+                                parts = [x.strip() for x in raw.split("=", 1)]
+                                if not parts[0]:
+                                    continue
+                                if len(parts) == 2:
+                                    try:
+                                        nxt = int(parts[1], 16) if parts[1].lower().startswith("0x") else int(parts[1])
+                                    except ValueError:
+                                        pass
+                                vals.setdefault(nxt, parts[0])
+                                nxt += 1
+                            hit.setdefault(m.group(1), vals)
+        _VANILLA_ENUMS[key] = hit
+    return hit
+
+
+class _Enums:
+    """Enum values back to names: the blob's own enums, then the game's."""
+    def __init__(self, blob, vanilla):
+        self.vanilla, self.local = vanilla, {}
+        for name, members in blob["enums"]:
+            v = vanilla.get(name)
+            extends = bool(v) and not all(any(m == x for m, _ in members) for x in v.values())
+            nxt = (max(v) + 1) if extends else 0
+            mp = {}
+            for m, value in members:
+                if value != 0x7FFFFFFF:
+                    nxt = value
+                mp.setdefault(nxt, m)
+                nxt += 1
+            self.local[name] = mp
+
+    def is_extension(self, name, members):
+        v = self.vanilla.get(name)
+        return bool(v) and not all(any(m == x for m, _ in members) for x in v.values())
+
+    def find(self, enum_type, value):
+        for src in (self.local, self.vanilla):
+            mp = src.get(enum_type)
+            if mp and value in mp:
+                return mp[value]
+        return None
+
+
+class _Stmt:
+    __slots__ = ("kind", "rt", "line", "e", "target", "target2")
+
+    def __init__(self, kind, rt, line):
+        self.kind, self.rt, self.line, self.e, self.target, self.target2 = kind, rt, line, None, 0, 0
+
+
+class RsblobDecompiler:
+    """One function's code back to WitcherScript statements (a port of W3 Mod Workbench's)."""
+
+    def __init__(self, blob, enums):
+        self.blob, self.enums = blob, enums
+
+    # --- statements
+    def body(self, func, depth):
+        self.func = func
+        self.code = rsblob_decode(func["code"])
+        self.pos = 0
+        self.member_next = False
+        self.stmts = self._statements()
+        self.index = {}
+        for i in range(len(self.stmts) - 1, -1, -1):
+            self.index[self.stmts[i].rt] = i
+        self.index[func["runtime"]] = len(self.stmts)
+        self.back = {}
+        for i, st in enumerate(self.stmts):
+            if st.kind == "jump" and st.target <= st.rt:
+                self.back.setdefault(st.target, []).append(i)
+        lines = []
+        self._emit(lines, 0, len(self.stmts), depth, (None, frozenset()))
+        while lines and not lines[-1]:
+            lines.pop()
+        return lines
+
+    def _statements(self):
+        out, line, switch_type = [], 0, None
+        code = self.code
+        while self.pos < len(code):
+            ins = code[self.pos]
+            st = _Stmt("expr", ins.rt, line)
+            op = ins.op
+            if op == "Line":
+                line = ins.args[0]
+                st.kind, st.line = "line", line
+                self.pos += 1
+            elif op in ("Nop", "Target", "SaveValue", "SavePointEnd"):
+                st.kind = "nop"
+                self.pos += 1
+            elif op == "SavePoint":
+                self.pos += 1
+                st.kind = "nop"
+                while self.pos < len(code) and code[self.pos].op != "SavePointEnd":
+                    if code[self.pos].op == "SaveValue":
+                        self.pos += 1
+                        self._expr()
+                    else:
+                        self.pos += 1
+                if self.pos < len(code):
+                    self.pos += 1
+            elif op == "JumpIfFalse":
+                self.pos += 1
+                st.kind, st.target = "if", ins.jump_target
+                st.e = self._expr()
+            elif op == "Jump":
+                self.pos += 1
+                st.kind, st.target = "jump", ins.jump_target
+            elif op == "Return":
+                self.pos += 1
+                st.kind = "return"
+                ret = self.func["ret"]
+                st.e = self._as_enum(ret[0]["type"] if ret else None, self._expr())
+            elif op == "Switch":
+                self.pos += 1
+                st.kind, st.target = "switch", ins.rt_end + ins.args[1]
+                st.e = self._expr()
+                t = self.blob["types"]
+                switch_type = st.e.type or (t[ins.args[0]][0] if 0 <= ins.args[0] < len(t) else None)
+            elif op == "SwitchLabel":
+                self.pos += 1
+                st.kind, st.target, st.target2 = "case", ins.rt + 3 + ins.args[0], ins.rt_end + ins.args[1]
+                st.e = self._as_enum(switch_type, self._expr())
+            elif op == "SwitchDefault":
+                self.pos += 1
+                st.kind = "default"
+            else:
+                st.e = self._expr()
+            out.append(st)
+        return out
+
+    def _meaningful(self, i):
+        return self.stmts[i].kind not in ("line", "nop")
+
+    def _prev(self, j, lower):
+        k = j - 1
+        while k >= lower and not self._meaningful(k):
+            k -= 1
+        return k
+
+    def _next(self, i, upper):
+        while i < upper and not self._meaningful(i):
+            i += 1
+        return i
+
+    def _at(self, rt):
+        return self.index.get(rt, -1)
+
+    def _group_start(self, i):
+        while i > 0 and self.stmts[i - 1].kind == "line":
+            i -= 1
+        return self.stmts[i].rt
+
+    def _is_loop(self, i, end):
+        """(exit, back jump) when the condition at i heads a loop: its body ends with a jump back to it."""
+        exit_ = self._at(self.stmts[i].target)
+        if exit_ < 0 or exit_ > end:
+            return None
+        k = self._prev(exit_, i + 1)
+        if k <= i or self.stmts[k].kind != "jump":
+            return None
+        to = self.stmts[k].target
+        if to != self.stmts[i].rt and to != self._group_start(i):
+            return None
+        return exit_, k
+
+    def _is_do_while(self, i, end):
+        jumps = self.back.get(self.stmts[i].rt)
+        if not jumps:
+            return None
+        first = self._next(i, end)
+        if first < end and self.stmts[first].kind == "if" and self._is_loop(first, end):
+            return None                                  # a while loop
+        for k in jumps:
+            if k <= i or k >= end:
+                continue
+            j = self._prev(k, i + 1)
+            if j > first and self.stmts[j].kind == "if" and self._at(self.stmts[j].target) == k + 1:
+                return j, k
+        return None
+
+    def _emit(self, lines, start, end, depth, ctx):
+        pad = "\t" * depth
+        brk, cont = ctx
+        count, last_line, i = 0, -1, start
+        S = self.stmts
+        while i < end:
+            st = S[i]
+            dw = self._is_do_while(i, end)
+            if dw:
+                cond, back = dw
+                lines += [pad + "do", pad + "{"]
+                self._emit(lines, i, cond, depth + 1, (S[cond].target, frozenset({S[cond].rt, self._group_start(cond)})))
+                lines.append(f"{pad}}} while ({S[cond].e.text});")
+                count += 1
+                i = back + 1
+                continue
+            if self._meaningful(i) and last_line > 0 and st.line > last_line + 1 and count > 0:
+                lines.append("")
+            if self._meaningful(i) and st.line > 0:
+                last_line = st.line
+            k = st.kind
+            if k in ("line", "nop"):
+                i += 1
+                continue
+            if k == "expr":
+                n = self._next(i + 1, end)
+                if n < end and S[n].kind == "if" and S[n].line == st.line:
+                    loop = self._is_loop(n, end)
+                    if loop:
+                        exit_, back = loop
+                        step = self._prev(back, n + 1)
+                        if step > n and S[step].kind == "expr" and S[step].line == st.line:
+                            lines += [f"{pad}for ({st.e.text}; {S[n].e.text}; {S[step].e.text})", pad + "{"]
+                            c = frozenset({S[step].rt, self._group_start(step), S[back].rt, self._group_start(back)})
+                            self._emit(lines, n + 1, step, depth + 1, (S[n].target, c))
+                            lines.append(pad + "}")
+                            count += 1
+                            i = exit_
+                            continue
+                lines.append(f"{pad}{st.e.text};")
+                count += 1
+                i += 1
+                continue
+            if k == "return":
+                lines.append(f"{pad}return;" if not st.e.text else f"{pad}return {st.e.text};")
+                count += 1
+                i += 1
+                continue
+            if k == "jump":
+                if brk == st.target:
+                    lines.append(f"{pad}break;")
+                elif st.target in cont:
+                    lines.append(f"{pad}continue;")
+                else:
+                    lines.append(f"{pad}// (jump to offset {st.target} could not be structured)")
+                count += 1
+                i += 1
+                continue
+            if k == "if":
+                loop = self._is_loop(i, end)
+                if loop:
+                    exit_, back = loop
+                    lines += [f"{pad}while ({st.e.text})", pad + "{"]
+                    c = frozenset({st.rt, self._group_start(i), S[back].rt, self._group_start(back)})
+                    self._emit(lines, i + 1, back, depth + 1, (st.target, c))
+                    lines.append(pad + "}")
+                    count += 1
+                    i = exit_
+                    continue
+                j = self._at(st.target)
+                if j < 0 or j > end:
+                    lines.append(f"{pad}if ({st.e.text})  // (target offset {st.target} could not be structured)")
+                    count += 1
+                    i += 1
+                    continue
+                kk = self._prev(j, i + 1)
+                else_end = self._at(S[kk].target) if kk > i and S[kk].kind == "jump" else -1
+                if (kk > i and S[kk].kind == "jump" and S[kk].target > st.target and brk != S[kk].target
+                        and S[kk].target not in cont and j <= else_end <= end):
+                    lines += [f"{pad}if ({st.e.text})", pad + "{"]
+                    self._emit(lines, i + 1, kk, depth + 1, ctx)
+                    lines.append(pad + "}")
+                    else_lines = []
+                    inner = self._emit(else_lines, j, else_end, depth + 1, ctx)
+                    ipad = pad + "\t"
+                    if inner == 1 and else_lines and else_lines[0].startswith(ipad + "if ("):
+                        lines.append(f"{pad}else {else_lines[0][len(ipad):]}")
+                        lines += [l[1:] if l.startswith("\t") else l for l in else_lines[1:]]
+                    else:
+                        lines += [pad + "else", pad + "{"] + else_lines + [pad + "}"]
+                    count += 1
+                    i = else_end
+                    continue
+                lines += [f"{pad}if ({st.e.text})", pad + "{"]
+                self._emit(lines, i + 1, j, depth + 1, ctx)
+                lines.append(pad + "}")
+                count += 1
+                i = j
+                continue
+            if k == "switch":
+                labels, idx, switch_end = [], self._at(st.target), -1
+                while 0 <= idx < end and S[idx].kind in ("case", "default") and idx not in labels:
+                    labels.append(idx)
+                    if S[idx].kind == "default":
+                        break
+                    nxt = self._at(S[idx].target)
+                    if nxt < 0 or nxt >= end or S[nxt].kind not in ("case", "default"):
+                        switch_end = nxt
+                        break
+                    idx = nxt
+                if not labels:
+                    lines.append(f"{pad}switch ({st.e.text})  // (cases could not be read)")
+                    count += 1
+                    i += 1
+                    continue
+                physical = sorted(labels)
+                if switch_end < 0:
+                    default_at, found = physical[-1], -1
+                    q = physical[0]
+                    while q < default_at and found < 0:
+                        if S[q].kind == "jump" and S[q].target > S[default_at].rt:
+                            found = self._at(S[q].target)
+                        q += 1
+                    switch_end = found if default_at < found <= end else end
+                break_rt = S[switch_end].rt if switch_end < len(S) else self.func["runtime"]
+                inner = (break_rt, cont)
+                lines += [f"{pad}switch ({st.e.text})", pad + "{"]
+                l = 0
+                while l < len(physical):
+                    run = l
+                    while run + 1 < len(physical) and self._next(physical[run] + 1, physical[run + 1]) == physical[run + 1]:
+                        run += 1
+                    for li in sorted(physical[l:run + 1], key=labels.index):
+                        lines.append(f"{pad}\tdefault:" if S[li].kind == "default" else f"{pad}\tcase {S[li].e.text}:")
+                    body_end = physical[run + 1] if run + 1 < len(physical) else switch_end
+                    self._emit(lines, physical[run] + 1, body_end, depth + 2, inner)
+                    l = run + 1
+                lines.append(pad + "}")
+                count += 1
+                i = max(switch_end, i + 1)
+                continue
+            lines.append(f"{pad}// (unexpected {k})")
+            i += 1
+        return count
+
+    # --- expressions
+    def _name(self, i):
+        n = self.blob["names"]
+        return n[i] if 0 <= i < len(n) else f"name{i}"
+
+    def _type(self, i):
+        t = self.blob["types"]
+        return _ws_type(t[i][0]) if 0 <= i < len(t) else f"type{i}"
+
+    @staticmethod
+    def _wrap(e, prec):
+        return f"({e.text})" if e.prec < prec else e.text
+
+    def _expr(self):
+        code = self.code
+        while self.pos < len(code) and code[self.pos].op in ("Line", "Target"):
+            self.pos += 1
+        if self.pos >= len(code):
+            raise ValueError("the code ended in the middle of an expression")
+        member, self.member_next = self.member_next, False
+        ins = code[self.pos]
+        self.pos += 1
+        op, a = ins.op, ins.args
+        P = _P_PRIMARY
+        if op == "Nop":
+            return _EMPTY
+        if op in _SIMPLE_OPS:
+            return _Expr(_SIMPLE_OPS[op], P)
+        if op == "IntOne":
+            return self._int(1)
+        if op == "IntZero":
+            return self._int(0)
+        if op in ("IntConst", "ShortConst", "ByteConst"):
+            return self._int(a[0])
+        if op == "FloatConst":
+            return _Expr(_fmt_float(ins.f), _P_UNARY if ins.f < 0 else P)
+        if op == "StringConst":
+            return _Expr(_quote(ins.text or ""), P)
+        if op == "NameConst":
+            return _Expr(f"'{self._name(a[0])}'", P)
+        if op == "LocalVar":
+            return self._var(a[0], self.func["locals"])
+        if op == "ParamVar":
+            return self._var(a[0], self.func["params"])
+        if op in ("ObjectVar", "BindableVar", "DefaultVar"):
+            nm = self._name(a[0])
+            return _Expr(nm, P, type=self._member_type(a[1], nm))
+        if op == "Parent":
+            of = self._expr()
+            return _Expr("parent" if of.text == "this" else f"{self._wrap(of, P)}.parent", P)
+        if op == "Assign":
+            l = self._expr()
+            r = self._as_enum(l.type, self._expr())
+            return _Expr(f"{l.text} = {r.text}", _P_ASSIGN)
+        if op == "Context":
+            obj = self._expr()
+            self.member_next = True
+            m = self._expr()
+            return _Expr(f"{self._wrap(obj, P)}.{m.text}", P, type=m.type)
+        if op == "StructMember":
+            of = self._expr()
+            nm = self._name(a[0])
+            return _Expr(f"{self._wrap(of, P)}.{nm}", P, type=self._member_type(a[1], nm))
+        if op == "FinalFunc":
+            f = a[2]
+            args = self._args()
+            if f == -1 and self.func["kind"] == "wrap":
+                return self._call("wrappedMethod", args)
+            if f <= 0:
+                return self._op_call(f, args)
+            refs = self.blob["func_refs"]
+            name, owner = refs[f - 1] if f - 1 < len(refs) else (f"func{f}", -1)
+            prefix = ""
+            cls = self.func["cls"]
+            types = self.blob["types"]
+            if (not member and owner >= 0 and cls is not None and name == self.func["name"]
+                    and owner < len(types) and types[owner][0] != cls["name"]):
+                prefix = "super."
+            return self._call(prefix + name, args)
+        if op == "VirtualFunc":
+            nm = self._name(a[2])
+            return self._call("wrappedMethod" if nm == "@self" else nm, self._args())
+        if op == "EntryFunc":
+            return self._call(self._name(a[1]), self._args())
+        if op == "VirtualParentFunc":
+            return self._call("super." + self._name(a[2]), self._args())
+        if op == "Conditional":
+            c, t, f = self._expr(), self._expr(), self._expr()
+            return _Expr(f"({c.text} ? {t.text} : {f.text})", P)
+        if op in ("TestEqual", "TestNotEqual"):
+            x, y = self._expr(), self._expr()
+            return self._binary(x, "==" if op == "TestEqual" else "!=", _P_EQ, y)
+        if op == "New":
+            owner = self._expr()
+            t = self._type(a[0])
+            return _Expr(f"new {t}" if not owner.text else f"new {t} in {self._wrap(owner, _P_UNARY)}", _P_UNARY)
+        if op == "Delete":
+            return _Expr(f"delete {self._wrap(self._expr(), _P_UNARY)}", _P_UNARY)
+        if op == "Constructor":
+            vals = []
+            for _n in range(a[0]):
+                if self.pos < len(code) and code[self.pos].op == "StructMember":
+                    self.pos += 1
+                vals.append(self._expr().text)
+            return _Expr(f"{self._type(a[1])}({', '.join(vals)})", P)
+        raw = _OP[op]
+        if _OP["ArrayClear"] <= raw <= _OP["ArrayElement"]:
+            return self._array(op)
+        if op in ("MapClear", "MapSize", "MapContains", "MapErase", "MapElement", "MapKey"):
+            m = self._wrap(self._expr(), P)
+            if op == "MapClear":
+                return _Expr(f"{m}.Clear()", P)
+            if op == "MapSize":
+                return _Expr(f"{m}.Size()", P)
+            word = {"MapContains": "Contains", "MapErase": "Erase", "MapKey": "Key"}.get(op)
+            return _Expr(f"{m}.{word}({self._expr().text})" if word else f"{m}[{self._expr().text}]", P)
+        if _OP["StaticArraySize"] <= raw <= _OP["StaticArrayElement"]:
+            s = self._wrap(self._expr(), P)
+            if op == "StaticArraySize":
+                return _Expr(f"{s}.Size()", P)
+            if op == "StaticArrayLast":
+                return _Expr(f"{s}.Last()", P)
+            word = {"StaticArrayFindFirst": "FindFirst", "StaticArrayFindFirstFast": "FindFirst",
+                    "StaticArrayFindLast": "FindLast", "StaticArrayFindLastFast": "FindLast",
+                    "StaticArrayContains": "Contains", "StaticArrayContainsFast": "Contains"}.get(op)
+            return _Expr(f"{s}.{word}({self._expr().text})" if word else f"{s}[{self._expr().text}]", P)
+        if op == "IntToEnum":
+            e = self._expr()
+            t = self._type(a[0])
+            if e.literal is not None:
+                c = self.enums.find(t, e.literal)
+                if c:
+                    return _Expr(c, P)
+            return e.with_(enum_type=t)
+        if op == "EnumToInt":
+            e = self._expr()
+            t = self._type(a[0])
+            c = self.enums.find(t, e.literal) if e.literal is not None else None
+            text = c if c else (f"({t}){e.literal}" if e.literal is not None else f"(int){self._wrap(e, _P_UNARY)}")
+            return _Expr(text, _P_UNARY, enum_type=t, inner=e)
+        if op == "DynamicCast":
+            return _Expr(f"({self._type(a[0])}){self._wrap(self._expr(), _P_UNARY)}", _P_UNARY)
+        if op in ("FloatToInt", "StringToInt", "BoolToInt"):
+            return _Expr(f"(int){self._wrap(self._expr(), _P_UNARY)}", _P_UNARY)
+        if op in ("StringToFloat", "BoolToFloat"):
+            return _Expr(f"(float){self._wrap(self._expr(), _P_UNARY)}", _P_UNARY)
+        if op in ("IntToByte", "FloatToByte", "StringToByte", "BoolToByte"):
+            return _Expr(f"(byte){self._wrap(self._expr(), _P_UNARY)}", _P_UNARY)
+        if op in ("ByteToBool", "ByteToInt", "ByteToFloat", "ByteToString", "BoolToString", "IntToBool",
+                  "IntToFloat", "IntToString", "FloatToBool", "FloatToString", "NameToBool", "NameToString",
+                  "StringToBool", "ObjectToBool", "ObjectToString", "EnumToString"):
+            return self._expr()                          # conversions the compiler puts in by itself
+        raise ValueError(f"{op} can't appear inside an expression")
+
+    def _var(self, idx, scope):
+        nm = self._name(idx)
+        return _Expr(nm, _P_PRIMARY, type=next((p["type"] for p in scope if p["name"] == nm), None))
+
+    def _member_type(self, type_idx, name):
+        t = self.blob["types"]
+        if not 0 <= type_idx < len(t):
+            return None
+        owner = t[type_idx][0]
+        for group in ("classes", "structs"):
+            for c in self.blob[group]:
+                if c["name"] == owner:
+                    for p in c["props"]:
+                        if p["name"] == name:
+                            return p["type"]
+        return next((f["type"] for f in self.blob["added_fields"] if f["owner"] == owner and f["name"] == name), None)
+
+    def _as_enum(self, type_, e):
+        if type_ is not None and e.literal is not None:
+            c = self.enums.find(type_, e.literal)
+            if c:
+                return _Expr(c, _P_PRIMARY)
+        return e
+
+    @staticmethod
+    def _int(v):
+        return _Expr(str(v), _P_UNARY if v < 0 else _P_PRIMARY, literal=v)
+
+    def _args(self):
+        out, code = [], self.code
+        while self.pos < len(code):
+            op = code[self.pos].op
+            if op == "ParamEnd":
+                self.pos += 1
+                break
+            if op == "Skip":
+                self.pos += 1
+                continue
+            out.append(self._expr())
+        return out
+
+    @staticmethod
+    def _call(name, args):
+        used = len(args)
+        while used > 0 and not args[used - 1].text:
+            used -= 1
+        return _Expr(f"{name}({', '.join(x.text for x in args[:used])})", _P_PRIMARY)
+
+    def _op_call(self, op_id, args):
+        kind, name = _operator(op_id)
+        if not kind or not 1 <= len(args) <= 2:
+            return _Expr(f"{name}({', '.join(x.text for x in args)})", _P_PRIMARY)
+        sym, prec = kind
+        if len(args) == 1:
+            return _Expr(f"{sym}{self._wrap(args[0], _P_UNARY)}", _P_UNARY)
+        return self._binary(args[0], sym, prec, args[1])
+
+    def _binary(self, x, sym, prec, y):
+        # enum == enum compiles to (int)a == (int)b: shown the way it was written
+        if x.enum_type is not None and x.enum_type == y.enum_type and x.inner is not None and y.inner is not None:
+            x = x.inner if x.inner.literal is None else x
+            y = y.inner if y.inner.literal is None else y
+        if prec == _P_ASSIGN:
+            return _Expr(f"{x.text} {sym} {y.text}", prec)
+        left = self._wrap(x, prec)
+        right = f"({y.text})" if y.prec <= prec else y.text
+        if sym in ("&&", "||") and y.prec == prec and sym in y.text:
+            right = y.text                               # && and || chains read flat
+        return _Expr(f"{left} {sym} {right}", prec)
+
+    def _array(self, op):
+        arr = self._wrap(self._expr(), _P_PRIMARY)
+        P = _P_PRIMARY
+        if op == "ArrayClear":
+            return _Expr(f"{arr}.Clear()", P)
+        if op == "ArraySize":
+            return _Expr(f"{arr}.Size()", P)
+        if op == "ArrayPopBack":
+            return _Expr(f"{arr}.PopBack()", P)
+        if op == "ArrayLast":
+            return _Expr(f"{arr}.Last()", P)
+        if op == "ArrayInsert":
+            at, value = self._expr(), self._expr()
+            return _Expr(f"{arr}.Insert({at.text}, {value.text})", P)
+        word = {"ArrayResize": "Resize", "ArrayGrow": "Grow", "ArrayFindFirst": "FindFirst",
+                "ArrayFindFirstFast": "FindFirst", "ArrayFindLast": "FindLast", "ArrayFindLastFast": "FindLast",
+                "ArrayContains": "Contains", "ArrayContainsFast": "Contains", "ArrayPushBack": "PushBack",
+                "ArrayRemove": "Remove", "ArrayRemoveFast": "Remove", "ArrayErase": "Erase",
+                "ArrayEraseFast": "Erase"}.get(op)
+        one = self._expr().text
+        return _Expr(f"{arr}.{word}({one})" if word else f"{arr}[{one}]", P)
+
+
+# flags (ScriptWriter's)
+_F_IMPORT, _F_FINAL, _F_EVENT, _F_LATENT, _F_ENTRY, _F_EXEC, _F_TIMER, _F_QUEST, _F_PRIVATE, _F_PROTECTED = \
+    0x1, 0x10, 0x20, 0x40, 0x80, 0x100, 0x400, 0x1000, 0x4000, 0x8000
+_V_EDITABLE, _V_CONST, _V_IMPORT, _V_SAVED, _V_PRIVATE, _V_PROTECTED = 0x1, 0x2, 0x4000, 0x8000, 0x10000, 0x20000
+_P_OUT, _P_OPTIONAL = 0x200, 0x400
+_C_IMPORT, _C_STATEMACHINE = 0x2, 0x400
+
+
+def _var_mods(flags):
+    s = "private " if flags & _V_PRIVATE else "protected " if flags & _V_PROTECTED else ""
+    for bit, word in ((_V_IMPORT, "import "), (_V_EDITABLE, "editable "), (_V_SAVED, "saved "), (_V_CONST, "const ")):
+        if flags & bit:
+            s += word
+    return s
+
+
+def rsblob_source(blob, scripts_dir=None, label=""):
+    """A whole precompiled.rsblob as one WitcherScript text, and where each function starts:
+    (text, {('class' or '', 'function') lower: line number, 1-based}). Comments and formatting
+    aren't kept in compiled scripts; enum values are named from the blob and the game's scripts."""
+    enums = _Enums(blob, _vanilla_enums(scripts_dir))
+    dec = RsblobDecompiler(blob, enums)
+    out, where = [], {}
+    out.append(f"// {label}: decompiled" if label else "// decompiled")
+    out.append(f"// Compiled with REDkit build {blob['build']} ({blob['configuration']}, {blob['platform']}). "
+               "Comments, formatting and variable initialisers aren't kept in compiled scripts.")
+    out.append("")
+
+    def function(f, depth, owner_for_key):
+        pad = "\t" * depth
+        ann = {"add": f"@addMethod({f['owner']})", "wrap": f"@wrapMethod({f['owner']})",
+               "replace": f"@replaceMethod({f['owner']})", "replace_global": "@replaceMethod()"}.get(f["kind"])
+        where.setdefault((owner_for_key.lower(), f["name"].lower()), len(out) + 1)
+        if ann:
+            out.append(pad + ann)
+        fl = f["flags"]
+        mods = "private " if fl & _F_PRIVATE else "protected " if fl & _F_PROTECTED else ""
+        for bit, word in ((_F_IMPORT, "import "), (_F_FINAL, "final "), (_F_ENTRY, "entry "), (_F_LATENT, "latent "),
+                          (_F_EXEC, "exec "), (_F_QUEST, "quest "), (_F_TIMER, "timer ")):
+            if fl & bit:
+                mods += word
+        mods += "event " if fl & _F_EVENT and not ann else "function "
+        params = ", ".join(("out " if p["flags"] & _P_OUT else "") + ("optional " if p["flags"] & _P_OPTIONAL else "")
+                           + f"{p['name']} : {_ws_type(p['type'])}" for p in f["params"])
+        ret = f" : {_ws_type(f['ret'][0]['type'])}" if f["ret"] else ""
+        head = f"{pad}{mods}{f['name']}({params}){ret}"
+        if not f["code"] or fl & _F_IMPORT:
+            out.append(head + ";")
+            out.append("")
+            return
+        out.append(head)
+        out.append(pad + "{")
+        for local in f["locals"]:
+            out.append(f"{pad}\tvar {local['name']} : {_ws_type(local['type'])};")
+        if f["locals"]:
+            out.append("")
+        try:
+            body = dec.body(f, depth + 1)
+        except (ValueError, IndexError, KeyError, struct.error) as e:
+            body = [f"{pad}\t// This function couldn't be decompiled: {e}"]
+        out.extend(body)
+        out.append(pad + "}")
+        out.append("")
+
+    def defaults(ds, props):
+        for prop, value, kids in ds:
+            t = next((p["type"] for p in props if p["name"] == prop), "")
+            if not kids:
+                out.append(f"\tdefault {prop} = {_default_value(t, value)};")
+            else:
+                _default_kids(out, prop, t, kids)
+        for p in props:
+            if p["hint"]:
+                out.append(f"\thint {p['name']} = {_quote(p['hint'])};")
+
+    for name, members in blob["enums"]:
+        if enums.is_extension(name, members):
+            out.append("// Adds values to the game's enum of the same name")
+        out.append(f"enum {name}")
+        out.append("{")
+        out.extend([f"\t{m}," if v == 0x7FFFFFFF else f"\t{m} = {v}," for m, v in members])
+        out.extend(["}", ""])
+    for s in blob["structs"]:
+        out.extend([f"struct {s['name']}", "{"])
+        out.extend([f"\t{_var_mods(p['flags'])}var {p['name']} : {_ws_type(p['type'])};" for p in s["props"]])
+        defaults(s["defaults"], s["props"])
+        out.extend(["}", ""])
+
+    def write_class(c):
+        if c["is_state"]:
+            out.append(f"state {c['name']} in {c['state_of']}" + (f" extends {c['base']}" if c["base"] else ""))
+        else:
+            mods = ("import " if c["flags"] & _C_IMPORT else "") + ("statemachine " if c["flags"] & _C_STATEMACHINE else "")
+            out.append(f"{mods}class {c['name']}" + (f" extends {c['base']}" if c["base"] else ""))
+        out.append("{")
+        out.extend([f"\t{_var_mods(p['flags'])}var {p['name']} : {_ws_type(p['type'])};" for p in c["props"]])
+        defaults(c["defaults"], c["props"])
+        if c["props"] or c["defaults"]:
+            out.append("")
+        for f in c["funcs"]:
+            function(f, 1, c["name"])
+        if out and not out[-1]:
+            out.pop()
+        out.extend(["}", ""])
+
+    classes = [c for c in blob["classes"] if not c["is_state"]]
+    defined = {c["name"] for c in classes}
+    for c in classes:
+        write_class(c)
+        for st in blob["classes"]:
+            if st["is_state"] and st["state_of"] == c["name"]:
+                write_class(st)
+    for st in blob["classes"]:
+        if st["is_state"] and st["state_of"] not in defined:
+            write_class(st)
+    for f in blob["replaced_globals"] + [f for f in blob["replaced"] + blob["added"] + blob["wrapped"] if not f["owner"]] \
+            + blob["globals"]:
+        function(f, 0, "")
+    targets = sorted({x["owner"] for x in blob["added_fields"] + blob["added"] + blob["wrapped"] + blob["replaced"]
+                      if x["owner"]}, key=str.lower)
+    for t in targets:
+        for fld in blob["added_fields"]:
+            if fld["owner"] == t:
+                out.extend([f"@addField({t})", f"{_var_mods(fld['flags'])}var {fld['name']} : {_ws_type(fld['type'])};", ""])
+        for f in blob["added"] + blob["wrapped"] + blob["replaced"]:
+            if f["owner"] == t:
+                function(f, 0, t)
+    while out and not out[-1]:
+        out.pop()
+    return "\n".join(out) + "\n", where
+
+
+def _default_value(t, value):
+    el = t[t.rfind(",") + 1:] if t.startswith("array:") else t
+    return _quote(value) if el == "String" else f"'{value}'" if el == "CName" else value
+
+
+def _default_kids(out, path, t, kids):
+    if all(not k for k, _v, _c in kids):
+        out.append(f"\t// default {path}: {len(kids)} array value{'s' if len(kids) != 1 else ''}")
+        out.extend([f"\t//     {_default_value(t, v) if not c else '{ ... }'}" for _k, v, c in kids])
+        return
+    for k, v, c in kids:
+        if not c:
+            out.append(f"\tdefault {path}.{k} = {v};")
+        else:
+            _default_kids(out, f"{path}.{k}", "", c)
 
 
 class KeptScans:
@@ -3666,6 +6146,12 @@ class KeptScans:
         with self.lock:
             self._files()[f"{kind}:{path}"] = [st.st_size, st.st_mtime_ns, st.st_ctime_ns, value]
             self.dirty = True
+
+    def drop(self, kind, path):
+        """Forget an entry (one kept in an older shape)."""
+        with self.lock:
+            if self._files().pop(f"{kind}:{path}", None) is not None:
+                self.dirty = True
 
     def save(self):
         with self.lock:
@@ -4561,6 +7047,288 @@ def _annotated_symbols(path):
     return out
 
 
+_WRAP_RE = re.compile(r"@wrapMethod\s*\(\s*(\w+)\s*\)\s*(?:\w+\s+)*?function\s+(\w+)", re.I)
+_CLASS_RE = re.compile(r"\b((?:(?:import|abstract|statemachine)\s+)*)class\s+(\w+)(?:\s+extends\s+(\w+))?", re.I)
+_STATE_RE = re.compile(r"\bstate\s+(\w+)\s+in\s+(\w+)", re.I)
+_TYPE_RE = re.compile(r"\b(?:struct|enum)\s+(\w+)\s*\{", re.I)
+_DECL_CACHE = {}
+
+
+def _script_text(path):
+    """A loose script's code with comments and quoted text blanked out, or '' if unreadable."""
+    try:
+        return _strip_code("\n".join(decode_script(Path(path).read_bytes())[0]))
+    except (OSError, UnicodeError, ValueError):
+        return ""
+
+
+def _wrapped_methods(path):
+    """{('@wrapmethod', class, name): 'Class.Name' as written} for what a loose script wraps with
+    @wrapMethod. Remembered like _annotated_symbols."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return {}
+    kept = KEPT.get("wrap", str(path), st)
+    if isinstance(kept, list):
+        try:
+            return {tuple(k): shown for k, shown in kept}
+        except (TypeError, ValueError):
+            pass
+    out = {}
+    try:
+        data = Path(path).read_bytes()
+        wide = data[:2] in (b"\xff\xfe", b"\xfe\xff") or b"\x00" in data[:400]
+        if wide or b"@wrapmethod" in data.lower():
+            for cls, nm in _WRAP_RE.findall(_script_text(path)):
+                out[("@wrapmethod", cls.lower(), nm.lower())] = f"{cls}.{nm}"
+    except OSError:
+        pass
+    KEPT.put("wrap", str(path), st, [[list(k), shown] for k, shown in out.items()])
+    return out
+
+
+def _class_decls(path):
+    """What a loose script defines and builds on: {'defines': {name lower: as written} (classes,
+    structs, enums; not `import class`, which declares one of the game's own), 'uses': {name
+    lower: as written} (the parent of each class it defines, and the class each of its states
+    belongs to)}. Remembered by size and time."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return {"defines": {}, "uses": {}}
+    sig = (str(path), st.st_mtime_ns, st.st_size)
+    hit = _DECL_CACHE.get(sig)
+    if hit is not None:
+        return hit
+    kept = KEPT.get("decl", str(path), st)
+    if isinstance(kept, dict) and set(kept) == {"defines", "uses"}:
+        _DECL_CACHE[sig] = kept
+        return kept
+    text = _script_text(path)
+    defines, uses = {}, {}
+    for mods_, nm, parent in _CLASS_RE.findall(text):
+        if "import" in mods_.lower():
+            continue
+        defines[nm.lower()] = nm
+        if parent:
+            uses[parent.lower()] = parent
+    for nm in _TYPE_RE.findall(text):
+        defines[nm.lower()] = nm
+    for _nm, machine in _STATE_RE.findall(text):
+        uses[machine.lower()] = machine
+    out = {"defines": defines, "uses": uses}
+    if len(_DECL_CACHE) > 20000:
+        _DECL_CACHE.clear()
+    _DECL_CACHE[sig] = out
+    KEPT.put("decl", str(path), st, out)
+    return out
+
+
+def _game_type_names(scripts_dir):
+    """Lower-case names of every class, struct and enum the game's own scripts declare (native
+    `import class` ones too), read once per folder and remembered for the session."""
+    key = str(scripts_dir)
+    hit = _GAME_TYPES.get(key)
+    if hit is not None:
+        return hit
+    # the same names game_script_index reads (and keeps between starts): not read twice
+    names = set(game_script_index(scripts_dir)["types"])
+    _GAME_TYPES[key] = names
+    return names
+
+
+
+# --- what scripts declare, for telling whether a mod's scripts can compile ------------------
+_DECL_TOKEN_RE = re.compile(
+    r"@\s*(?P<ann>\w+)\s*(?:\(\s*(?P<annc>\w*)\s*\))?"
+    r"|\b(?P<kw>class|struct|enum|state|function|event)\b"
+    r"|(?P<open>\{)|(?P<close>\})|(?P<semi>;)")
+_HEAD_RE = {
+    "class": re.compile(r"\s*(\w+)(?:\s+extends\s+(\w+))?"),
+    "struct": re.compile(r"\s*(\w+)"),
+    "enum": re.compile(r"\s*(\w+)"),
+    "state": re.compile(r"\s*(\w+)\s+in\s+(\w+)(?:\s+extends\s+(\w+))?"),
+    "function": re.compile(r"\s*(\w+)"),
+    "event": re.compile(r"\s*(\w+)"),
+}
+_INDEX_CACHE = {}
+
+
+def script_index_text(text):
+    """What one script declares, read from its code (comments and quoted text blanked first):
+    {'types': {name: base or ''} for classes, structs and enums, 'states': {state: machine},
+    'state_base': {state: base state}, 'members': {'class.function'} for the functions and events
+    declared in a class or state (native 'import' ones too), 'globals': {function} for the ones
+    outside any class, 'annotated': [(annotation, class, function)] for @wrapMethod and the like,
+    and 'spelt': {lower: as written}}. All names lower case. A state is named in full, its
+    machine and its name together ('w3horsecomponentstateexploration'); its base in state_base is
+    the base state's own name, as written after extends."""
+    out = {"types": {}, "states": {}, "state_base": {}, "members": set(), "globals": set(),
+           "annotated": [], "spelt": {}}
+    stack, pending, ann = [], None, None            # stack: ("class", name) / ("block", None)
+    for m in _DECL_TOKEN_RE.finditer(text):
+        if m.group("ann"):
+            ann = (m.group("ann").lower(), (m.group("annc") or "").lower())
+            if m.group("annc"):
+                out["spelt"].setdefault(ann[1], m.group("annc"))
+            continue
+        if m.group("semi"):
+            pending, ann = None, None
+            continue
+        if m.group("open"):
+            stack.append(pending or ("block", None))
+            pending, ann = None, None
+            continue
+        if m.group("close"):
+            if stack:
+                stack.pop()
+            pending, ann = None, None
+            continue
+        kw = m.group("kw")
+        h = _HEAD_RE[kw].match(text, m.end())
+        if not h:
+            continue
+        name = h.group(1)
+        low = name.lower()
+        out["spelt"].setdefault(low, name)
+        owner = next((c for k, c in reversed(stack) if k in ("class", "state")), None) \
+            if stack and stack[-1][0] in ("class", "state") else None
+        if kw in ("class", "struct", "enum"):
+            if not stack or stack[-1][0] != "block":     # not "class" inside code: a declaration
+                base = (h.group(2) or "").lower() if kw == "class" else ""
+                if kw == "class" and h.group(2):
+                    out["spelt"].setdefault(base, h.group(2))
+                out["types"][low] = base
+                pending = ("class" if kw == "class" else "block", low)
+        elif kw == "state":
+            # a state goes by its full name, as annotations name it: Exploration in W3HorseComponent
+            # is W3HorseComponentStateExploration. Several machines have one called Exploration
+            machine = h.group(2).lower()
+            full = f"{machine}state{low}"
+            out["spelt"].setdefault(machine, h.group(2))
+            out["spelt"].setdefault(full, f"{h.group(2)}State{name}")
+            out["states"][full] = machine
+            if h.group(3):
+                out["state_base"][full] = h.group(3).lower()       # a state's name, resolved later
+            pending = ("state", full)
+        else:                                         # function / event
+            if ann and ann[0] in ("wrapmethod", "replacemethod", "addmethod"):
+                out["annotated"].append((ann[0], ann[1], low))
+                if ann[0] == "addmethod" and ann[1]:
+                    out["members"].add(f"{ann[1]}.{low}")
+            elif owner:
+                out["members"].add(f"{owner}.{low}")
+            elif not stack:
+                out["globals"].add(low)
+            ann = None
+            pending = ("block", None)                 # its body, if it has one
+    return out
+
+
+def _index_out(idx):
+    """A script index as JSON can hold it (sets as sorted lists), for scans.json."""
+    return {k: (sorted(v) if isinstance(v, set) else [list(a) for a in v] if k == "annotated" else v)
+            for k, v in idx.items()}
+
+
+def _index_in(data):
+    """A script index back from scans.json; None if it isn't one."""
+    try:
+        return {"types": dict(data["types"]), "states": dict(data["states"]), "state_base": dict(data["state_base"]),
+                "members": set(data["members"]), "globals": set(data["globals"]),
+                "annotated": [tuple(a) for a in data["annotated"]], "spelt": dict(data["spelt"])}
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def script_index(path, keep=True):
+    """script_index_text for a script file, remembered by its size and time; {} if unreadable.
+    keep: also kept between starts (scans.json), so a mod's scripts aren't read again each start."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return {}
+    sig = (str(path), st.st_size, st.st_mtime_ns)
+    hit = _INDEX_CACHE.get(sig)
+    if hit is None:
+        kept = KEPT.get("idx2", str(path), st) if keep else KEPT.MISSING
+        hit = _index_in(kept) if isinstance(kept, dict) else None
+        if hit is None:
+            text = _script_text(path)
+            hit = script_index_text(text) if text else {}
+            if keep and hit:
+                KEPT.put("idx2", str(path), st, _index_out(hit))
+                KEPT.drop("idx", str(path))                  # the old shape, states by short name
+        if len(_INDEX_CACHE) > 20000:
+            _INDEX_CACHE.clear()
+        _INDEX_CACHE[sig] = hit
+    return hit
+
+
+def merge_index(into, idx):
+    """Add one script's index to a combined one (a folder's, or the game's)."""
+    for k in ("types", "states", "state_base", "spelt"):
+        for name, v in idx.get(k, {}).items():
+            into.setdefault(k, {}).setdefault(name, v)
+    for k in ("members", "globals"):
+        into.setdefault(k, set()).update(idx.get(k, ()))
+    into.setdefault("annotated", []).extend(idx.get("annotated", ()))
+    return into
+
+
+_GAME_INDEX = {}
+
+
+def game_script_index(scripts_dir):
+    """The game's own scripts, indexed (script_index), read once per session. Kept between
+    starts too (scans.json), as one entry for the whole folder: reading all ~1500 of the game's
+    scripts costs a second or more, so it's done again only when one of them changed (a patch)."""
+    key = str(scripts_dir)
+    hit = _GAME_INDEX.get(key)
+    if hit is None:
+        hit = {"types": {}, "states": {}, "state_base": {}, "members": set(), "globals": set(), "annotated": [], "spelt": {}}
+        if scripts_dir and Path(scripts_dir).is_dir():
+            paths = sorted(Path(dp, f) for dp, _dn, files in os.walk(scripts_dir)
+                           for f in files if f.lower().endswith(".ws"))
+            try:
+                sig = hashlib.sha1(repr([(str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in paths]).encode()).hexdigest()
+                st = os.stat(scripts_dir)
+            except OSError:
+                sig = st = None
+            kept = KEPT.get("gameidx2", key, st) if st else KEPT.MISSING
+            done = _index_in(kept[1]) if isinstance(kept, list) and len(kept) == 2 and kept[0] == sig else None
+            if done is not None:
+                hit = done
+            else:
+                for p in paths:
+                    merge_index(hit, script_index(p, keep=False))
+                if st:
+                    KEPT.put("gameidx2", key, st, [sig, _index_out(hit)])
+                    KEPT.drop("gameidx", key)
+        _GAME_INDEX[key] = hit
+    return hit
+
+
+_GAME_TYPES = {}
+_GAME_RELS = {}
+
+
+def _game_script_rels(scripts_dir):
+    """Lower-case paths (relative, with /) of the game's own scripts, read once per session."""
+    key = str(scripts_dir)
+    hit = _GAME_RELS.get(key)
+    if hit is None:
+        hit = set()
+        if scripts_dir and os.path.isdir(key):
+            for dp, _dn, files in os.walk(key):
+                rel = os.path.relpath(dp, key).replace(os.sep, "/").lower()
+                for f in files:
+                    hit.add(f.lower() if rel == "." else f"{rel}/{f.lower()}")
+        _GAME_RELS[key] = hit
+    return hit
+
+
 def duplicate_decls(decls):
     seen, dups = set(), set()
     for d in decls:
@@ -4773,6 +7541,9 @@ def _landing(pieces, start):
 
 
 _GONE = ("<deleted>",)
+
+
+_CONTAINER = re.compile(r"(\.bundle|(^|/)metadata\.store|\.cache)$", re.I)   # hold packed files, not files of their own
 
 
 def _bodies(lines, functions=None):
@@ -6111,6 +8882,13 @@ def _xml_check_fields(base, docs, merged, m):
 
 # ------------------------------------------------------------------- core ---
 
+def settings_gapped(lines):
+    """Does a settings file leave a blank line between its sections? The game's own files don't;
+    one edited by hand often does. A section the app adds follows the file's style."""
+    heads = [i for i, line in enumerate(lines) if INI_SECTION.match(line)]
+    return any(i > 0 and not lines[i - 1].strip() for i in heads[1:])
+
+
 def _settings_split(body):
     """A settings file's lines: split on line breaks only (str.splitlines would also split on
     characters like U+2028 inside a value, changing the line)."""
@@ -6183,7 +8961,8 @@ class ModManager:
         backup = self.state_file.with_suffix(".json.bak")
         for f in (self.state_file, backup):
             try:
-                data = json.loads(f.read_text())
+                raw = f.read_text()
+                data = json.loads(raw)
             except FileNotFoundError:
                 continue
             except (OSError, ValueError):
@@ -6194,6 +8973,8 @@ class ModManager:
                     for k in ("version", "skip_update"):
                         if isinstance(m, dict) and isinstance(m.get(k), str) and m[k]:
                             m[k] = clean_version(m[k])
+                if f == self.state_file:
+                    self._note_saved(raw)
                 return state
         if self.state_file.exists() or backup.exists():
             raise OSError(f"The mod list in {self.state_file} is damaged and couldn't be read. "
@@ -6201,13 +8982,34 @@ class ModManager:
                           "start fresh (files already in the game would then show as unmanaged).")
         return state
 
+    def _note_saved(self, text):
+        """What state.json holds now (its text, size and time), so a save that would write the
+        same again is skipped."""
+        try:
+            st = self.state_file.stat()
+            self._saved = (text, st.st_size, st.st_mtime_ns)
+        except OSError:
+            self._saved = None
+
     def save(self):
         self._tidy_groups()                         # every change ends here: groups stay whole
+        # compact: Python's fast JSON writer only runs without indentation, and this file is
+        # saved several times per change — pretty-printing it cost a noticeable pause each time
+        text = json.dumps(self.state, separators=(",", ":"))
+        saved = getattr(self, "_saved", None)
+        if saved and saved[0] == text:
+            # nothing changed since the last save: writing it again (and waiting for the disk,
+            # which on some file systems takes a tenth of a second each time) is skipped, unless
+            # the file was changed or removed meanwhile
+            try:
+                st = self.state_file.stat()
+                if (st.st_size, st.st_mtime_ns) == saved[1:]:
+                    return
+            except OSError:
+                pass
         tmp = self.state_file.with_suffix(".tmp")
         with open(tmp, "w") as f:
-            # compact: Python's fast JSON writer only runs without indentation, and this file is
-            # saved several times per change — pretty-printing it cost a noticeable pause each time
-            f.write(json.dumps(self.state, separators=(",", ":")))
+            f.write(text)
             f.flush()
             os.fsync(f.fileno())
         if self.state_file.exists():
@@ -6216,6 +9018,7 @@ class ModManager:
             except OSError:
                 pass
         tmp.replace(self.state_file)
+        self._note_saved(text)
 
     @property
     def rows(self):
@@ -6384,6 +9187,84 @@ class ModManager:
                             out.append(rel)
         return sorted(out, key=str.lower)
 
+    def _bin_dirs(self, mod):
+        """The folders in bin/ that hold a mod's files (bin/x64_dx12, bin/x64_dx12/plugins…)."""
+        return sorted({rel.rpartition("/")[0] for rel in self.mod_files(mod)
+                       if rel.lower().startswith("bin/") and rel.count("/") > 1}, key=str.lower)
+
+    def _note_bin_listing(self, mod, old=()):
+        """What's in each bin/ folder a mod puts files in, before it does: what shows up there later
+        that no mod placed was made by it (ReShade's log and presets, a plugin's cache) or by you,
+        and uninstalling it offers that too. An update keeps what its earlier version noted."""
+        seen = {}
+        for o in old:
+            for d, names in (o.get("bin_seen") or {}).items():
+                seen.setdefault(d, names)
+        known = {d.lower() for d in seen}
+        for d in self._bin_dirs(mod):
+            if d.lower() in known:
+                continue
+            path = ci_path(self.game, d)
+            seen[d] = [c.name for c in kids(path)] if path.is_dir() else []
+        if seen:
+            mod["bin_seen"] = seen
+
+    def stray_candidates(self, ids):
+        """What uninstalling these mods offers to remove besides their own files, with a reason not
+        to be sure of one: [(path relative to the game folder, [names of mods staying that might have
+        made it instead], sure)]. Files in a mod's own folder (see stray_files) are sure. In bin/: what
+        has appeared in a folder the mod puts files in since it was installed, that no mod placed.
+        Not sure when another mod staying installed uses that folder too, or when the mod was
+        installed before the app noted what was there (then: made since it was installed)."""
+        out = [(rel, [], True) for rel in self.stray_files(ids)]
+        listed = {rel.lower() for rel, _o, _s in out}
+        placed = {k.lower() for k in self.state.get("deployed", {})}
+        staying = [m for m in self.mods if m["id"] not in ids]
+        shipped = {rel.lower() for m in staying for rel in self.mod_files(m)}
+        for m in self.mods:
+            if m["id"] not in ids:
+                continue
+            seen = {d.lower(): {n.lower() for n in names} for d, names in (m.get("bin_seen") or {}).items()}
+            for d in self._bin_dirs(m):
+                path = ci_path(self.game, d)
+                if not path.is_dir():
+                    continue
+                sharing = [o for o in staying if d.lower() in {x.lower() for x in self._bin_dirs(o)}]
+                snap = seen.get(d.lower())
+
+                def maybe(o, entry):
+                    """Can this other mod have made it? Not if it was there before that mod came."""
+                    theirs = {k.lower(): {n.lower() for n in v} for k, v in (o.get("bin_seen") or {}).items()}.get(d.lower())
+                    if theirs is not None:
+                        return entry.name.lower() not in theirs
+                    try:
+                        return entry.stat().st_mtime > o.get("installed", 0)
+                    except OSError:
+                        return True
+                for entry in kids(path):
+                    if snap is not None:
+                        if entry.name.lower() in snap:
+                            continue
+                    else:
+                        try:
+                            if entry.stat().st_mtime <= m.get("installed", 0):
+                                continue
+                        except OSError:
+                            continue
+                    if entry.is_symlink():
+                        continue
+                    others = [o["name"] for o in sharing if maybe(o, entry)]
+                    files = [entry] if entry.is_file() else \
+                        [Path(dp, f) for dp, _dn, fs in os.walk(entry) for f in fs] if entry.is_dir() else []
+                    for f in files:
+                        rel = f.relative_to(self.game).as_posix()
+                        low = rel.lower()
+                        if low in placed or low in shipped or low in listed or f.is_symlink():
+                            continue
+                        listed.add(low)
+                        out.append((rel, others, snap is not None and not others))
+        return sorted(out, key=lambda x: x[0].lower())
+
     def stage_dir(self, mod):
         return self.staging / mod["id"]
 
@@ -6488,6 +9369,22 @@ class ModManager:
             plan, note = analyze(tmpdir, clean_stem(archive.name))
             keybinds = scan_keybind_files(tmpdir)
             keybinds["mod_info"] = read_mod_info(tmpdir)
+            only = settings_only(tmpdir)
+            if only:
+                # just the game's settings files: nothing goes into the game folder. An
+                # input.settings is a keybind preset (its sections take your sections' place);
+                # the others are read like a readme's lines
+                plan, note = [], None
+                if "input.settings" in only:
+                    src = only["input.settings"]
+                    keybinds["input_preset_src"] = src
+                    text, bom = ModManager._read_settings_text(tmpdir / src)[:2]
+                    keybinds["input_preset_sections"] = [
+                        mm.group(1).strip() for mm in map(INI_SECTION.match, text[len(bom):].splitlines()) if mm]
+                    # its lines aren't instructions to add one by one: the preset takes care of them
+                    keybinds["keybind_lines"], keybinds["keybind_source"] = {}, []
+                    if set(keybinds.get("snippet_source") or ()) <= {src}:
+                        keybinds["user_settings"], keybinds["snippet_source"] = {}, []
         except Exception:
             shutil.rmtree(tmpdir, ignore_errors=True)
             raise
@@ -6837,10 +9734,12 @@ class ModManager:
             runs.setdefault(g["run"], []).append(mid)
         now, changed = int(time.time()), set()
         ids = [i for i in ids if (self.get(i) or {}).get("sep") is not True and self.get(i)]
+        marked = self.marked()
         for mid in ids:
             m = self.get(mid)
-            if on and not m["enabled"]:
-                m["enabled_at"] = now                 # switching it on counts as arriving
+            if on and not m["enabled"] and mid not in marked:
+                m["enabled_at"] = now                 # switching it on counts as arriving (not one
+                                                      # back from "Turn all mods off": it was there)
             if m["enabled"] != on:
                 changed.add(mid)
             m["enabled"] = on
@@ -6856,11 +9755,71 @@ class ModManager:
                     k["enabled"], k["off_with"] = False, mid
                     changed.add(kid)
                 elif on and k.get("off_with") == mid:
-                    k["enabled"], k["enabled_at"] = True, now
+                    k["enabled"] = True
+                    if kid not in marked:
+                        k["enabled_at"] = now
                     k.pop("off_with")
                     changed.add(kid)
+        for cid in changed:
+            # the game forgets a mod's menu values when it runs without the mod: kept while it's
+            # off, back when it's on (as for its menu alone, see _menu_switched)
+            m = self.get(cid)
+            if "menu" not in (m.get("snippets_off") or ()):
+                self._menu_switched(m, on=m["enabled"])
+        self._prune_marks()
         self.save()
         return changed
+
+    # --- "Turn all mods off": every mod unticked, the ones that were on marked until they're on again
+    def marked(self):
+        """Ids of the mods "Turn all mods off" switched off that are still off: their row is marked."""
+        return {i for i in self.state.get("was_on") or () if self.get(i) and not self.get(i)["enabled"]}
+
+    def _prune_marks(self):
+        """A mark goes once its mod is on again (or gone); the last one gone, nothing is left."""
+        if "was_on" not in self.state:
+            return
+        live = [i for i in self.state["was_on"] if self.get(i) and not self.get(i)["enabled"]]
+        if live:
+            self.state["was_on"] = live
+        else:
+            self.state.pop("was_on")
+
+    def switch_all_off(self):
+        """Untick every mod that's on, marking each (for finding a mod that causes a problem: back
+        on one or a few at a time). Their settings are kept as when any mod is switched off."""
+        on = [m["id"] for m in self.mods if m["enabled"]]
+        if not on:
+            return 0
+        if game_running():
+            raise RuntimeError("The game is running. Close it first.")
+        self.state["was_on"] = list(on)
+        # a linked file whose main mod is on goes off with it, as when you untick the main mod: so
+        # ticking the main mod back on brings its files back with it
+        links = self.link_groups()
+        main_of = {g["run"]: i for i, g in links.items() if g["main"]}
+        on_set = set(on)
+        kids = {i for i in on if i in links and not links[i]["main"] and main_of.get(links[i]["run"]) in on_set}
+        self.set_enabled([i for i in on if i not in kids], False)
+        left = [i for i in kids if self.get(i)["enabled"]]          # not linked after all: as they are
+        if left:
+            self.set_enabled(left, False)
+        self.state["was_on"] = list(on)                 # set_enabled leaves marks on mods that are off
+        self.save()
+        self.sync()
+        return len(on)
+
+    def switch_marked_on(self):
+        """Every marked mod back on; no marks left."""
+        ids = sorted(self.marked(), key=lambda i: self.rows.index(self.get(i)))
+        if game_running():
+            raise RuntimeError("The game is running. Close it first.")
+        if ids:
+            self.set_enabled(ids, True)              # while still marked: each keeps when it arrived
+        self.state.pop("was_on", None)
+        self.save()
+        self.sync()
+        return len(ids)
 
     def edit_mod(self, mid, name, version, nexus, section, snippets_off=None, make_main=None):
         """Apply what the Edit window says. Returns True when the game's settings files need
@@ -6907,7 +9866,8 @@ class ModManager:
             if m.get("menu_kept"):
                 m["menu_back"] = True
             return
-        m.pop("menu_back", None)
+        if m.pop("menu_back", None) and m.get("menu_kept"):
+            return              # switched on and off again before its values went back: still waiting
         kept = self._menu_values_now(only=m)
         if kept:
             m["menu_kept"] = kept
@@ -6919,12 +9879,18 @@ class ModManager:
         is in the game and the settings files can be written (not while the game runs)."""
         for m in self.mods:
             if not m.get("menu_back"):
+                if m.get("menu_kept") and self.snippet_on(m, "menu"):
+                    m.pop("menu_kept")                   # its menu's in the game: nothing to wait for (an older
+                    #                                      version kept values saved while all mods were off here)
                 continue
             if not self.snippet_on(m, "menu"):
                 continue                                 # off again, or the mod's off: wait
             if not self.settings_dir() or game_running():
                 continue                                 # the game would write over them on exit
-            self._restore_menu_values(m.pop("menu_kept", None) or {})
+            # where the mod's lines from its instructions sat among them: _write_user_settings
+            # puts them back there
+            self._menu_hints = {**getattr(self, "_menu_hints", {}),
+                                **self._restore_menu_values(m.pop("menu_kept", None) or {})}
             m.pop("menu_back", None)
 
     def set_group_main(self, mid, save=True):
@@ -6966,6 +9932,13 @@ class ModManager:
         for oid in old_ids:
             if oid in binds:
                 binds.setdefault(mid, []).extend(binds.pop(oid))
+        moved = self.state.get("keybinds_kept", {})
+        for oid in old_ids:
+            if oid in moved:
+                moved.setdefault(mid, {}).update(moved.pop(oid))
+        if old_ids & set(self.state.get("was_on") or ()):
+            # updated while marked: the new version keeps the mark
+            self.state["was_on"] = [i for i in self.state["was_on"] if i not in old_ids] + [mid]
 
     def _section_end(self, sep_id):
         """Where a new mod goes: the bottom of its section (None: of the part above every
@@ -6993,8 +9966,11 @@ class ModManager:
         # stage the new copy first: if that fails, the old version is still fully installed
         mid = uuid.uuid4().hex[:12]
         stage = self.staging / mid
+        preset = (keybinds or {}).get("input_preset_src")
         try:
             self._save_docs(tmpdir, self.docs_dir(mid))      # before staging moves files out
+            if preset:
+                shutil.copyfile(Path(tmpdir) / preset, self.docs_dir(mid) / PRESET_KEEP)
             build_staging(plan, stage)
         except BaseException:
             shutil.rmtree(stage, ignore_errors=True)
@@ -7003,7 +9979,8 @@ class ModManager:
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
         targets = self._scan_targets(stage)
-        if not targets:
+        kb = keybinds or {}
+        if not targets and not (preset or kb.get("user_settings") or kb.get("keybind_lines")):
             shutil.rmtree(stage, ignore_errors=True)
             raise RuntimeError("Nothing to install: nothing was selected, or the archive is empty.")
         old_section = KEEP_PLACE
@@ -7032,14 +10009,18 @@ class ModManager:
         if not replace_ids or (section != KEEP_PLACE and section != old_section):
             pos = self._section_end(None if section == KEEP_PLACE else section)
         mod = {"id": mid, "name": display, "version": clean_version(version), "nexus": nexus_id, "enabled": enabled,
+               **({} if replace_ids else {"fresh": int(time.time())}),
                "archive": str(archive), "installed": int(time.time()), "targets": targets}
         mod.update(keybinds or {})
+        if mod.pop("input_preset_src", None):
+            mod["input_preset"] = PRESET_KEEP
         if mod.get("user_settings_own") and "snippets_off" not in (keybinds or {}):
             # the mod's own config files start off when nothing chose otherwise (the Install window does)
             mod["snippets_off"] = sorted(set(mod.get("snippets_off") or ()) | {"user_own"})
         # which file of its Nexus page it is (main or optional), and a main mod you picked: an
         # update keeps them unless the new download says otherwise
-        for key in ("group_main", "nexus_cat", "orphan"):
+        self._note_bin_listing(mod, old)
+        for key in ("group_main", "nexus_cat", "orphan", "menu_kept", "menu_back", "menu_hidden"):
             got = next((o[key] for o in old if o.get(key)), None)
             if got and not (extra or {}).get(key):
                 mod[key] = got
@@ -7256,6 +10237,71 @@ class ModManager:
             out += [(key, item) for item, mods in rec["decided"] if item in res and set(mods) & theirs]
         return out
 
+    def fresh_sections(self, now=None):
+        """Ids of the sections holding a mod installed in the last FRESH_FOR seconds that you
+        haven't looked at yet (see clear_fresh): their row in the list gets a bronze edge."""
+        now = now or time.time()
+        out, current = set(), None
+        for r in self.rows:
+            if r.get("sep"):
+                current = r["id"]
+            elif current and r.get("fresh") and now - r["fresh"] < FRESH_FOR:
+                out.add(current)
+        return out
+
+    def clear_fresh(self, ids=None):
+        """No longer new: these mods (you selected them), or every one older than FRESH_FOR.
+        -> anything changed."""
+        now, changed = time.time(), False
+        for m in self.mods:
+            if m.get("fresh") and ((ids is not None and m["id"] in ids)
+                                   or (ids is None and now - m["fresh"] >= FRESH_FOR)):
+                m.pop("fresh")
+                changed = True
+        if changed:
+            self.save()
+        return changed
+
+    def merge_again(self, forget=False):
+        """Everything this app merges, made again from the mods as they are: its merge folder
+        (mods/mod0000_AutoMerged) goes from the game and from _ModManager/merged, what it knew
+        about earlier merges is forgotten, and a sync builds it all anew. The keys you changed in a
+        merged .ini stay. Your answers in Script decisions stay too, unless forget: then every one
+        is an open question again. -> how many files are merged."""
+        if self.state.get("mods_off"):
+            return None
+        self.sync()                                      # first: keys you changed in a merged .ini are kept
+        prefix = f"mods/{AUTO_MERGE_NAME}/".lower()
+        deployed = self.state["deployed"]
+        # everything merged that's placed in the game: our folder, and merged .ini files in bin/
+        for actual in [a for a, info in deployed.items() if a.lower().startswith(prefix) or info.get("mod") == AUTO_ID]:
+            dst = self.game / actual
+            try:
+                if dst.is_symlink() or dst.is_file():
+                    dst.unlink()
+            except FileNotFoundError:
+                pass
+            if deployed[actual].get("backup"):
+                self._restore(actual)
+            del deployed[actual]
+            self._prune_made(dst)
+        self.save()                                      # never lose track of what's placed
+        mods_dir = ci_child(self.game, "mods")
+        left = ci_child(mods_dir, AUTO_MERGE_NAME) if mods_dir else None
+        if left and left.is_dir() and not left.is_symlink():
+            shutil.rmtree(left)                          # our own folder: anything left in it goes too
+        if self.merged_dir.is_dir():
+            shutil.rmtree(self.merged_dir)
+        self.state["merges"] = {}
+        if forget:
+            self.state["resolutions"] = {}
+        self.__dict__.pop("_details", None)
+        self._clashes = None
+        self.forget_scans()
+        self.save()
+        self.sync()
+        return sum(1 for r in self.state.get("merges", {}).values() if r.get("status") in ("merged", "superset"))
+
     def clear_decisions(self, mid):
         """Forget your answers where this mod was involved; those spots become open questions again.
         Returns the files affected."""
@@ -7286,6 +10332,7 @@ class ModManager:
         for o in self.mods:
             if o.get("off_with") in ids:
                 o.pop("off_with", None)                      # switched off with a mod that's gone: stays off
+        bin_dirs = {d.lower() for m in gone for d in self._bin_dirs(m)}
         self.state["mods"] = [r for r in self.rows if r["id"] not in ids]
         self.save()
         self.sync()
@@ -7296,6 +10343,15 @@ class ModManager:
                 continue                                   # placed by a mod meanwhile, or not a plain file
             if move_to_trash(path):
                 self._prune_made(path)                    # the mod's own folders, now empty
+                # a folder the mod's tool made inside one of its bin/ folders (ReShade's shader
+                # cache), now empty: goes too; the bin/ folder itself stays
+                up = path.parent
+                while up != self.game and up.is_dir() and not any(up.iterdir()):
+                    rel_up = up.relative_to(self.game).as_posix().lower()
+                    if rel_up in bin_dirs or not any(rel_up.startswith(d + "/") for d in bin_dirs):
+                        break
+                    up.rmdir()
+                    up = up.parent
         for m in gone:
             shutil.rmtree(self.stage_dir(m), ignore_errors=True)
             shutil.rmtree(self.docs_dir(m["id"]), ignore_errors=True)
@@ -7612,9 +10668,13 @@ class ModManager:
 
     # --- .ini files in bin/ (rendering.ini, a plugin's settings…): merged key by key (ini_merge)
     def _ini_inputs(self):
-        """{key: {'rel', 'sources': [(label, path, mod id, mod id)]}} for every .ini in bin/ that a
+        """{key: {'rel', 'sources': [(label, path, mod id, mod id)]}} for every .ini in bin/config/ that a
         loaded mod ships and the game has too (so what you set in the game's copy is kept), or that
-        two or more mods ship. Top priority first."""
+        two or more mods ship. Top priority first. Elsewhere in bin/ (a plugin's .ini next to the
+        game's exe) only when two or more mods ship it: a copy already there isn't the game's but the
+        tool's own. And never ReShade's: ReShade writes its .ini back whole in its own way (two
+        lines of one key become one list, doubled again on every save), so it's placed as the mod
+        has it, and what ReShade saves into it is kept in the mod's copy."""
         rem = self.remastered()
         found = {}
         for mod in self.ranked:
@@ -7622,13 +10682,15 @@ class ModManager:
                 continue
             for rel in self.mod_files(mod):
                 low = rel.lower()
-                if not (low.startswith("bin/") and low.endswith(".ini")) or (rem and low.startswith("bin/x64/")):
+                if not (low.startswith("bin/") and low.endswith(".ini")) or Path(low).name.startswith("reshade") \
+                        or (rem and low.startswith("bin/x64/")):
                     continue
                 entry = found.setdefault(INI_KEY + low, {"rel": rel, "sources": []})
                 entry["sources"].append((mod["name"], self.stage_dir(mod) / rel, mod["id"], mod["id"]))
         out = {}
         for key, entry in found.items():
-            if len(entry["sources"]) > 1 or self._vanilla_file(entry["rel"]) is not None:
+            game_own = entry["rel"].lower().startswith("bin/config/") and self._vanilla_file(entry["rel"]) is not None
+            if len(entry["sources"]) > 1 or game_own:
                 entry["sources"] = self._unique_labels(entry["sources"])
                 out[key] = entry
         return out
@@ -7688,7 +10750,9 @@ class ModManager:
             self._drop_output(self.merged_dir / rec["rel"])
             # what you edited in it stays in the game's own copy once no mod is merged into it
             mine = self.state.get("ini_yours", {}).pop(rec["rel"].lower(), None)
-            if mine:
+            if mine and not Path(rec["rel"].lower()).name.startswith("reshade"):
+                # (a tool's .ini merged by an older version, ReShade.ini: what was kept for it is
+                # dropped, not written into the copy set aside: it may hold lists ReShade doubled)
                 self._ini_into_original(rec["rel"], {(x[0], x[1], x[2]): x[3] for x in mine})
 
     def _ini_into_original(self, rel, yours):
@@ -8659,6 +11723,24 @@ class ModManager:
         self._keep_details(key, recipe, result)
         return result
 
+    def merged_view(self, key):
+        """A merged script or XML file as the game gets it, for the viewer: {rel, lang, base, merged,
+        versions}, or None when it isn't merged (anymore) or its files can't be read."""
+        rec = self.state.get("merges", {}).get(key)
+        if not rec or rec["status"] not in ("merged", "superset") or key.startswith(INI_KEY):
+            return None
+        det = self.merge_details(key)
+        if not det or det.get("status") not in ("merged", "superset"):
+            return None
+        lines = det.get("lines")
+        if lines is None and det.get("text") is not None:
+            lines = det["text"].split("\n")             # XML: the merged text
+        if lines is None:
+            return None
+        return {"rel": det["rel"], "lang": det.get("lang", "ws"), "base": list(det["base_lines"]),
+                "merged": list(lines), "versions": [(l, list(v)) for l, v in det["versions"]],
+                "decided": bool(rec.get("items"))}
+
     def save_resolutions(self, key, answers):
         """answers: {item key: [lines]}. Stored by content, so they survive removing and
         re-adding a mod, or reordering — and only come back up if those lines change."""
@@ -8737,6 +11819,11 @@ class ModManager:
                         conv = self._utf8_copy(mod, rel)
                         if conv is not None:
                             self._converted[(mod["id"], rel)] = conv
+                    if mod.get("menu_hidden") and self._is_menu_file(mod, rel):
+                        hid = self._hidden_menu_copy(mod, rel)
+                        if hid is not None:
+                            self._converted[(mod["id"], rel)] = hid
+        self._place_menus(desired)
         t.mark("UTF-8 copies")
         for dp, _dn, files in os.walk(self.merged_dir):  # merged scripts, deployed like a mod
             for f in files:
@@ -8821,6 +11908,7 @@ class ModManager:
             self.save()                                  # never lose track of what's placed
         self._prune_converted()
         t.mark("place files")
+        self._keep_deps_below()
         self._write_mods_settings()
         t.mark("mods.settings")
         self._update_filelists()
@@ -9088,6 +12176,113 @@ class ModManager:
         except OSError:
             return None
         return out
+
+    def _is_menu_file(self, mod, rel):
+        """Is this file of the mod one of its menus (user_config_matrix/pc/x.xml)?"""
+        pre = FILELIST_DIR.lower() + "/"
+        low = rel.lower()
+        return low.startswith(pre) and "/" not in low[len(pre):] and low.endswith(".xml") \
+            and Path(rel).name.lower() in {n.lower() for n in self.menu_files(mod)}
+
+    def _hidden_menu_copy(self, mod, rel):
+        """The copy of a mod's menu file placed in the game while you have its menu hidden there
+        (hide_menu_xml): made from what would be placed otherwise (its UTF-8 copy on 5.x), in
+        _ModManager/converted, made again when that changes. The mod's own file is never changed.
+        None when it can't be made (the original is placed then)."""
+        src = getattr(self, "_converted", {}).get((mod["id"], rel)) or self.stage_dir(mod) / rel
+        out = self.converted_dir / mod["id"] / "hidden-menu" / rel
+        try:
+            data = hide_menu_xml(Path(src).read_bytes())
+            if data is None:
+                return None
+            self._write_output(out, data)
+        except OSError:
+            return None
+        return out
+
+    _MENU_GROUPS = {}
+
+    def _menu_groups_of(self, path):
+        """menu_groups of a file, read once per change of it."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return []
+        key = (str(path), st.st_size, st.st_mtime_ns)
+        if key not in self._MENU_GROUPS:
+            try:
+                self._MENU_GROUPS[key] = menu_groups(Path(path).read_bytes())
+            except (OSError, UnicodeError, ValueError):
+                self._MENU_GROUPS[key] = []
+        return self._MENU_GROUPS[key]
+
+    def _menu_script_names(self):
+        """The quoted names in mods' scripts that deal with the game's menu pages (Sharedutils'
+        descriptors, a wrap of OnShowOptionSubmenu…): a page named there is left where it is."""
+        names = set()
+        for m in self.mods:
+            for _path, text in self._script_texts(m):
+                if re.search(r"SU_onMenuEntered|OnShowOptionSubmenu|GetGroupDisplayName|OptionSubmenu|MenuDescriptor", text):
+                    names.update(x.lower() for x in re.findall(r'"([^"\\\n]{1,80})"', text))
+        return names
+
+    def _place_menus(self, desired):
+        """A mod's menu page that's alone in its folder in the game's menu moves up into the
+        folder's place (menu_flatten_plan; Settings: "Open a mod's only menu page directly"): its
+        menu file is placed as a copy saying so, made in _ModManager/converted. Worked out over
+        every menu the game reads, the ones the app doesn't place too."""
+        if not load_config().get("flatten_menus", True):
+            return
+        pre = FILELIST_DIR.lower() + "/"
+        groups, files = [], {}
+        mods = {m["id"]: m for m in self.mods}
+        for low, (mid, rel) in desired.items():
+            if not low.startswith(pre) or "/" in low[len(pre):] or not low.endswith(".xml"):
+                continue
+            m = mods.get(mid)
+            if not m or not self._is_menu_file(m, rel):
+                continue
+            if m.get("menu_hidden"):
+                continue                                 # its pages are out of the game's menu
+            src = getattr(self, "_converted", {}).get((mid, rel)) or self.stage_dir(m) / rel
+            files[(mid, rel)] = src
+            groups += [(mid, g, dn, has) for g, dn, has in self._menu_groups_of(src)]
+        pc = ci_path(self.game, FILELIST_DIR)
+        for f in (sorted(pc.iterdir()) if pc.is_dir() else []):
+            if f.is_file() and f.suffix.lower() == ".xml" and (FILELIST_DIR + "/" + f.name).lower() not in desired:
+                groups += [(None, g, dn, has) for g, dn, has in self._menu_groups_of(f)]
+        if not files:
+            return
+        plan = menu_flatten_plan(groups)
+        if plan:                                     # only then are the scripts read for page names
+            plan = menu_flatten_plan(groups, self._menu_script_names())
+        for (mid, rel), src in files.items():
+            places = {g: dn for (o, g), dn in plan.items() if o == mid and
+                      g in {x.lower() for x, _d, _h in self._menu_groups_of(src)}}
+            if not places:
+                continue
+            out = self.converted_dir / mid / "flat-menu" / rel
+            try:
+                data = rewrite_menu_xml(Path(src).read_bytes(), places=places)
+                if data is None:
+                    continue
+                self._write_output(out, data)
+            except OSError:
+                continue
+            self._converted[(mid, rel)] = out
+
+    def set_menu_hidden(self, mid, hidden):
+        """Show or hide a mod's menu in the game (its settings keep working, and stay changeable
+        in the app). Placed at the next sync. Returns whether it changed."""
+        m = self.get(mid)
+        if not m or bool(m.get("menu_hidden")) == bool(hidden):
+            return False
+        if hidden:
+            m["menu_hidden"] = True
+        else:
+            m.pop("menu_hidden", None)
+        self.save()
+        return True
 
     def _prune_converted(self):
         """UTF-8 copies nothing uses any more (a mod removed or switched off, a 4.x game) go."""
@@ -9373,6 +12568,20 @@ class ModManager:
                 texts = {W3S_TEXT.get((low, sid)) for low, (_n, _m, res) in folders.items() if r in res}
                 if len(texts) == 1 and None not in texts:
                     settled.add(r)
+        # the same packed file, byte for byte (size and CRC32 from the bundles' tables), in every
+        # folder that packs it: whichever is used, the game gets the same file
+        identical, sigs = set(), {}
+        for r, n in count.items():
+            if n > 1 and r[0] == "packed" and not r[1].startswith(TEXT_ID) and r not in settled:
+                have = set()
+                for low, (_n, _m, res) in folders.items():
+                    if r in res:
+                        if low not in sigs:
+                            sigs[low] = folder_packed_sigs(self._folder_path(low))
+                        have.add(sigs[low].get(r[1]))
+                if len(have) == 1 and None not in have:
+                    identical.add(r)
+        settled |= identical
         needs = {low for low, (_n, _m, res) in folders.items()
                  if any(count[r] > 1 and r not in settled for r in res)}
         # precompiled scripts (5.00's precompiled.rsblob) are noted, but never get a number by
@@ -9380,8 +12589,95 @@ class ModManager:
         # (add the same method, define the same class) no order fixes: annotation_clashes
         # reads them. Only a shared file gets a number
         blobs = {low for low in folders if folder_has_rsblob(self._folder_path(low))}
-        self._clashes = {"needs": needs, "folders": folders, "blobs": blobs}
+        links = self._script_links(folders, blobs)
+        # ...except where order is known to matter: a precompiled mod's replacement of a function
+        # another precompiled mod wraps (the wrapper is skipped when the replacement is higher),
+        # and a mod that builds on another mod's classes (that one has to load after it: the game
+        # compiles scripts in reverse load order, and mods with a number load before those without)
+        for w in links["wraps"]:
+            needs |= set(w["replacers"]) | set(w["wrappers"])
+        for _round in range(4):
+            before = len(needs)
+            for user, deps in links["deps"].items():
+                for dep in deps:
+                    if dep in needs:
+                        needs.add(user)
+                    elif user not in needs and not user < dep:
+                        needs |= {user, dep}             # unnumbered folders load in name order
+            if len(needs) == before:
+                break
+        self._clashes = {"needs": needs, "folders": folders, "blobs": blobs, "deps": links["deps"], "identical": identical,
+                         "wraps": links["wraps"], "symbols": links["symbols"]}
         return self._clashes
+
+    def _script_links(self, folders, blobs):
+        """How loaded mod folders' scripts build on each other, read from their precompiled
+        scripts and their own loose ones (not copies of the game's scripts):
+        'deps': {folder: {folder it needs: [class names]}} for a class (or a state's class) one
+        defines on top of a class only one other folder defines, and the game doesn't;
+        'wraps': [{'key': (class, function) lower, 'shown', 'replacers': [folder], 'wrappers':
+        [folder]}] for a function a precompiled mod replaces and another precompiled mod wraps;
+        'symbols': {folder: {key: shown}} of what each precompiled mod declares."""
+        vanilla = ci_path(self.game, VANILLA_SCRIPTS)
+        game_rels = _game_script_rels(vanilla)
+        defines, uses, symbols = {}, {}, {}
+        for low in folders:
+            if low == AUTO_MERGE_NAME.lower():
+                continue
+            root = self._folder_path(low)
+            content = ci_child(root, "content") if root else None
+            if not content:
+                continue
+            d, u = defines.setdefault(low, {}), uses.setdefault(low, {})
+            scripts = ci_child(content, "scripts")
+            sroot = str(scripts) if scripts else None
+            for dp, _dn, files in os.walk(content):
+                inside = sroot is not None and (dp == sroot or dp.startswith(sroot + os.sep))
+                for f in files:
+                    fl = f.lower()
+                    if fl.endswith(".rsblob") and low in blobs:
+                        sym = rsblob_symbols(Path(dp, f))
+                        symbols.setdefault(low, {}).update(sym)
+                        for key, shown in sym.items():
+                            if key[0] == "type":
+                                d[key[2]] = shown
+                            elif key[0] == "extends":
+                                u[key[2]] = shown
+                            elif key[0] == "state":
+                                u[key[1]] = shown.split(".", 1)[0]
+                    elif fl.endswith(".ws") and inside:
+                        sub = os.path.relpath(dp, sroot).replace(os.sep, "/").lower()
+                        if (fl if sub == "." else f"{sub}/{fl}") in game_rels:
+                            continue                     # a copy of a game script: its classes are the game's
+                        got = _class_decls(os.path.join(dp, f))
+                        d.update(got["defines"])
+                        u.update(got["uses"])
+        definers = {}
+        for low, names in defines.items():
+            for n in names:
+                definers.setdefault(n, set()).add(low)
+        deps, game = {}, None
+        for low, used in uses.items():
+            for n, shown in used.items():
+                if n in defines.get(low, {}):
+                    continue
+                others = definers.get(n, set()) - {low}
+                if len(others) != 1:
+                    continue                             # nobody, or several (which one is used isn't known)
+                if game is None:
+                    game = _game_type_names(vanilla)
+                if n in game:
+                    continue
+                dep = next(iter(others))
+                deps.setdefault(low, {}).setdefault(dep, []).append(shown)
+        wraps = {}
+        for low, sym in symbols.items():
+            for key, shown in sym.items():
+                if key[0] in ("@replacemethod", "@wrapmethod"):
+                    w = wraps.setdefault(key[1:], {"key": key[1:], "shown": shown, "replacers": [], "wrappers": []})
+                    w["replacers" if key[0] == "@replacemethod" else "wrappers"].append(low)
+        wraps = [w for w in wraps.values() if w["replacers"] and set(w["wrappers"]) - set(w["replacers"])]
+        return {"deps": deps, "wraps": wraps, "symbols": symbols}
 
     def settings_rows(self):
         """The mods.settings order: [(folder, enabled, owning mod id or None)], top first."""
@@ -9430,7 +12726,10 @@ class ModManager:
         # Script Merger's folder is switched off only while our merge stands in for it
         legacy = self.state.get("legacy") or {}
         user_legacy = self.state.get("legacy_enabled") or en.get(MERGED_NAME, "1")
-        legacy_off = legacy.get("mode") == "off" and any(m["enabled"] for m in self.mods)
+        # Also off while "Turn all mods off" has mods marked: what it merged holds their code, and
+        # with them off it would be the one thing of theirs left in the game
+        legacy_off = (legacy.get("mode") == "off" and any(m["enabled"] for m in self.mods)) \
+            or (bool(legacy) and self.settings_dir() is not None and bool(self.marked()))
         legacy_en = "0" if legacy_off else user_legacy
         # numbers: 1 is always our merge folder's, even before there is one, so the mods' numbers
         # never shift when a merge appears or goes. Script Merger's folder comes right after it
@@ -9449,6 +12748,49 @@ class ModManager:
             given = {e["name"].lower(): _int(e.get("Priority"), None) for e in existing}
             numbers = [given.get(n.lower()) or k for (n, _e, _m), k in zip(rows, numbers)]
         return rows, ours, [n for n, _e in yours], numbers
+
+    def _keep_deps_below(self):
+        """A mod another mod builds on (see _script_links) stays below it in priority, whatever
+        order it was given: the game compiles scripts in reverse load order, so the one that needs
+        it would meet its classes before they exist and the game wouldn't start."""
+        c = self.clashes()
+        owner = {low: mid for low, (_n, mid, _r) in c["folders"].items()}
+        pairs = {(owner.get(u), owner.get(d)) for u, ds in c.get("deps", {}).items() for d in ds}
+        pairs = {(u, d) for u, d in pairs if u and d and u != d}
+        if not pairs:
+            return
+        prio = self.priority_ids()
+        changed = False
+        for _round in range(len(prio)):
+            moved = False
+            for u, d in sorted(pairs):
+                if u in prio and d in prio and prio.index(d) < prio.index(u):
+                    prio.remove(d)
+                    prio.insert(prio.index(u) + 1, d)
+                    moved = changed = True
+            if not moved:
+                break
+        if changed:
+            self.state["priority"] = prio
+            self.save()
+
+    def script_links_of(self, mod):
+        """(needed by, needs): [names of mods that build on this one's classes] and [names of the
+        mods it builds on], for its priority tooltip (see _script_links)."""
+        c = self.clashes()
+        mine = {t.split("/", 1)[1].lower() for t in mod["targets"] if t.lower().startswith("mods/")}
+        def name(low):
+            label, mid = c["folders"][low][0], c["folders"][low][1]
+            return (self.get(mid) or {}).get("name") if mid and self.get(mid) else label
+        by, needs = [], []
+        for user, deps in c.get("deps", {}).items():
+            for dep in deps:
+                if dep in mine and user not in mine:
+                    by.append(name(user))
+                elif user in mine and dep not in mine:
+                    needs.append(name(dep))
+        key = str.lower
+        return sorted(set(by), key=key), sorted(set(needs), key=key)
 
     def _folder_path(self, low):
         """Where a loaded mod folder (lower-case name) is: a managed mod's staged copy, our merge
@@ -9733,10 +13075,11 @@ class ModManager:
                     wanted, same, calls = got
         except NexusUnreachable as e:
             return {"checked": 0, "asked": 0, "skipped": skipped, "fresh": 0, "unchanged": 0,
-                    "capped": False, "left": len(wanted), "offline": str(e)}
+                    "capped": False, "left": len(wanted), "offline": str(e), "pages_left": list(wanted)}
         fresh = len(all_ids) - len(wanted) - len(same)
         wanted.sort(key=lambda n: cache.get(n, {}).get("checked", 0))   # stalest first
         checked, left, offline = 0, 0, ""
+        done = []                                        # the pages asked about, for counting mods
         for i, nid in enumerate(wanted):
             # Nexus's own remaining count already drops with every call, so it's compared
             # against zero; only the blind budget (no numbers from Nexus yet) counts calls
@@ -9773,6 +13116,7 @@ class ModManager:
                 cache[nid] = {**cache.get(nid, {}), "available": False, "status": "hidden",
                               "checked": int(time.time())}
                 checked += 1
+                done.append(nid)
                 if progress:
                     progress(checked, len(wanted))
                 continue
@@ -9794,24 +13138,8 @@ class ModManager:
                     got = self.nexus_file_of(m, cache[nid])
                     if got and got[1]["cat"] in NEXUS_LIVE:
                         m["nexus_cat"] = got[1]["cat"]
-            # the changelog: only for a page with an update waiting, and only when that update is
-            # one it wasn't fetched for yet (one call; skipped when the allowance runs short)
-            waiting = sorted({v for m in self.mods if str(m.get("nexus") or "") == nid
-                              for v in [self.update_waiting(m)] if v})
-            if waiting and cache[nid].get("changelog_for") != waiting:
-                room = allowance() >= 1 if any(k.endswith("-remaining") for k in LAST_LIMITS) else calls + 1 <= BLIND_BUDGET
-                if room:
-                    try:
-                        cache[nid]["changelog"] = nexus_changelog(
-                            nexus_get(f"{NEXUS_GAME}/mods/{nid}/changelogs.json", api_key))
-                        cache[nid]["changelog_for"] = waiting
-                    except NexusUnreachable as e:
-                        offline = str(e)                 # this page is done; the rest waits
-                    except RuntimeError as e:
-                        if "rate limit" in str(e) or isinstance(e, NexusKeyRejected):
-                            raise
-                    calls += 1
             checked += 1
+            done.append(nid)
             if progress:
                 progress(checked, len(wanted))
             if checked % 20 == 0:
@@ -9822,9 +13150,46 @@ class ModManager:
         if not left and not offline and only is None:
             self.state["nexus_checked"] = int(time.time())
         self.pin_nexus_files()                           # each mod's own upload, now that it's known
+        if not offline:
+            calls = self._fetch_changelogs(all_ids, api_key, calls)
         self.save()
         return {"checked": checked + len(same), "asked": checked, "unchanged": len(same), "skipped": skipped,
-                "fresh": fresh, "capped": bool(left) and not offline, "left": left, "offline": offline}
+                "fresh": fresh, "capped": bool(left) and not offline, "left": left, "offline": offline,
+                "pages_asked": done, "pages_same": list(same),
+                "pages_left": [n for n in wanted if n not in set(done)] if left else []}
+
+    def _fetch_changelogs(self, pages, api_key, calls=0):
+        """The changelog of every page here with an update waiting that it wasn't fetched for yet:
+        asked once all pages are checked and each mod's own upload is known, so an update found
+        earlier whose changelog couldn't be had then (allowance short, Nexus busy, a page that
+        hasn't changed since) gets it now. One call each; stops when the allowance runs short or
+        Nexus stops answering, and the rest wait for the next check."""
+        cache = self.state.setdefault("nexus_cache", {})
+        for nid in pages:
+            page = cache.get(nid)
+            if not page or not page.get("files"):
+                continue
+            waiting = sorted({v for m in self.mods if str(m.get("nexus") or "") == nid
+                              for v in [self.update_waiting(m)] if v})
+            if not waiting or page.get("changelog_for") == waiting:
+                continue
+            known = any(k.endswith("-remaining") for k in LAST_LIMITS)
+            if not (allowance() >= 1 if known else calls + 1 <= BLIND_BUDGET):
+                break
+            calls += 1
+            try:
+                page["changelog"] = nexus_changelog(nexus_get(f"{NEXUS_GAME}/mods/{nid}/changelogs.json", api_key))
+                page["changelog_for"] = waiting
+            except NexusUnreachable:
+                break
+            except NexusForbidden:
+                page["changelog"], page["changelog_for"] = {}, waiting     # hidden: none to have
+            except RuntimeError as e:
+                if "rate limit" in str(e) or isinstance(e, NexusKeyRejected):
+                    break
+                if "HTTP 404" in str(e):
+                    page["changelog"], page["changelog_for"] = {}, waiting # the page has none
+        return calls
 
     @staticmethod
     def nexus_upload_of(m, page):
@@ -9935,6 +13300,17 @@ class ModManager:
         for f in same:
             if nexus_order(f["version"], f.get("at") or 0, newest["version"], newest.get("at") or 0) > 0:
                 newest = f
+        if newest.get("cat") not in NEXUS_LIVE:
+            # your main file is no longer offered, and Nexus records nothing that replaced it: the
+            # page's one main file, uploaded after it, is its update (Reduce Frequency Or Remove New
+            # Idle Animations: "ReduceWipeAnimFreq" 1 archived, "CustomAnimWeight" 2 the main file
+            # now). Never a guess between two main files, and never for an optional file
+            live = [f for f in files if f.get("cat") in NEXUS_LIVE]
+            mains = [f for f in live if f.get("cat") == "MAIN"]
+            was_main = m.get("nexus_cat") == "MAIN" or (not m.get("nexus_cat") and len(live) == 1)
+            # (only when it's known when yours was uploaded: without that, nothing says it's older)
+            if was_main and len(mains) == 1 and newest.get("at") and (mains[0].get("at") or 0) > newest["at"]:
+                newest = {**mains[0], "successor": True}
         return mine, newest
 
     def nexus_line(self, nid, file_id=None, file_name=None):
@@ -9952,16 +13328,21 @@ class ModManager:
             fid = next((str(f["id"]) for f in files if f.get("file_name") and archive_stem(f["file_name"]) == want), "")
         if not fid:
             return set()
-        links = {}
+        # what it came from and what came from it, never sideways: an "All in One" file that
+        # Nexus records as replacing both the main file and the music pack (Music Plus) joins
+        # neither to the other, and a file split in two doesn't make its two halves one line
+        newer, older = {}, {}
         for old, new in real_updates(page):
-            links.setdefault(str(old), set()).add(str(new))
-            links.setdefault(str(new), set()).add(str(old))
-        line, todo = {fid}, [fid]
-        while todo:
-            for other in links.get(todo.pop(), ()):
-                if other not in line:
-                    line.add(other)
-                    todo.append(other)
+            newer.setdefault(str(old), set()).add(str(new))
+            older.setdefault(str(new), set()).add(str(old))
+        line = {fid}
+        for links in (newer, older):
+            todo = [fid]
+            while todo:
+                for other in links.get(todo.pop(), ()):
+                    if other not in line:
+                        line.add(other)
+                        todo.append(other)
         return line
 
     def upload_time(self, nid, file_id=None, file_name=None):
@@ -10014,6 +13395,16 @@ class ModManager:
         mod m came from, by Nexus's own record of which file replaced which?"""
         if not nid or str(m.get("nexus") or "") != str(nid):
             return False
+        page = self.state.get("nexus_cache", {}).get(str(nid)) or {}
+        got = self.nexus_file_of(m, page) if page.get("files") else None
+        if got and got[1].get("successor"):
+            # the page's main file that took the place of yours (see nexus_file_of): by its id, or its name
+            fid = nexus_file_id(file_id)
+            if not fid and file_name:
+                want = archive_stem(Path(file_name).name)
+                fid = next((str(f["id"]) for f in page["files"] if f.get("file_name") and archive_stem(f["file_name"]) == want), "")
+            if fid and fid == str(got[1]["id"]):
+                return True
         line = self.nexus_line(nid, file_id, file_name)
         if len(line) < 2:
             return False                            # nothing recorded: only its name can tell
@@ -10032,6 +13423,7 @@ class ModManager:
         got = self.nexus_file_of(m, page)
         if got:
             out["version"], out["file"] = got[1]["version"], got[1]["name"]
+            out["successor"] = bool(got[1].get("successor"))
             mine, newest = got
             if mine.get("at") and newest.get("at"):
                 # Nexus's own record decides, as for downloads (nexus_order)
@@ -10056,6 +13448,32 @@ class ModManager:
         if not newer or clean_version(rem["version"]) == clean_version(m.get("skip_update")):
             return None
         return rem["version"]
+
+    def page_ahead(self, m, skipped_too=False):
+        """The version a mod's Nexus page gives, when it's newer than yours but no file of the page
+        can be told to be your file's update (the author uploaded it under another name, with no
+        record of what it replaces). Only for the page's main mod, and never when an update is
+        found the usual way: then None. An ignored version stays hidden (unless skipped_too)."""
+        nid = str(m.get("nexus") or "")
+        page = self.state.get("nexus_cache", {}).get(nid)
+        if not page or not page.get("available", True) or not page.get("version"):
+            return None
+        if m.get("nexus_cat") not in (None, "", "MAIN") or self.group_main(nid) is not m:
+            return None                              # not the page's main mod: the page's version isn't its own
+        got = self.nexus_file_of(m, page) if page.get("files") else None
+        if got and got[1].get("cat") in NEXUS_LIVE:
+            # your file is still offered, newest of its line: the page's version is another file's
+            # (a second "main" file, Global Lighting Fix V2 2.0 next to Better Vanilla Lighting
+            # Changes 2.1, whose version the page gives)
+            return None
+        rem = self.remote_for(m)
+        if rem.get("newer") or not version_is_newer(page["version"], m.get("version")):
+            return None
+        if rem.get("version") and not version_is_newer(page["version"], rem["version"]):
+            return None                              # its own file already is the page's version
+        if not skipped_too and clean_version(page["version"]) == clean_version(m.get("skip_update")):
+            return None
+        return page["version"]
 
     # --- info
     def scan_hints(self):
@@ -10105,6 +13523,98 @@ class ModManager:
         return not self.state.get("mods_off") and self._snippet_on(mod, kind)
 
     # --- input.settings
+    def _preset_sections(self, mod):
+        """[(section, [its lines])] of a keybind preset, as its file has them (blank lines
+        included), or [] when its file can't be read."""
+        path = self.docs_dir(mod["id"]) / mod["input_preset"]
+        try:
+            raw, bom, _nl, _final = self._read_settings_text(path)
+        except (OSError, UnicodeError, ValueError):
+            return []
+        out = []
+        for line in _settings_split(raw[len(bom):]):
+            m = INI_SECTION.match(line)
+            if m:
+                out.append((m.group(1).strip(), []))
+            elif out:
+                out[-1][1].append(line)
+        return out
+
+    def _input_preset_step(self, lines, tracked):
+        """A keybind preset (a mod that's only an input.settings): each section it has takes your
+        section's place, and yours is kept. When it's off, removed or replaced, your sections come
+        back as they were, except one changed since (you rebound a key in the game): that stays.
+        Lines this app adds for other mods don't count either way: they're added again after.
+        lines: input.settings as lines, changed in place. -> the sections it touched (lower case)."""
+        applied = self.state.get("input_preset")
+        want = next((m for m in self.ranked if m.get("input_preset") and self.snippet_on(m, "input_preset")), None)
+        ours = {e[1] for es in tracked.values() for e in es}
+        touched = set()
+
+        def find(name):
+            for i, line in enumerate(lines):
+                mm = INI_SECTION.match(line)
+                if mm and mm.group(1).strip().lower() == name.lower():
+                    end = next((j for j in range(i + 1, len(lines)) if INI_SECTION.match(lines[j])), len(lines))
+                    return i, end
+            return None
+
+        def content(body):
+            return [l.strip() for l in body if l.strip() and l.strip() not in ours]
+        sig = None
+        if want:
+            try:
+                sig = hashlib.sha1((self.docs_dir(want["id"]) / want["input_preset"]).read_bytes()).hexdigest()
+            except OSError:
+                want = None
+        if applied and (not want or want["id"] != applied.get("mid") or sig != applied.get("sig")):
+            for name, saved, blank in reversed(applied.get("saved", [])):
+                rng = find(name)
+                if rng is None:
+                    continue
+                h, end = rng
+                if content(lines[h + 1:end]) != content(applied.get("wrote", {}).get(name, [])):
+                    continue                             # changed since: yours now, it stays
+                if saved is None:
+                    del lines[h:end]
+                    if blank and h and not lines[h - 1].strip():
+                        del lines[h - 1]
+                else:
+                    lines[h + 1:end] = saved
+                touched.add(name.lower())
+            self.state.pop("input_preset", None)
+            applied = None
+        if want and not applied:
+            sections = self._preset_sections(want)
+            saved, wrote = [], {}
+            for name, body in sections:
+                rng = find(name)
+                if rng:
+                    h, end = rng
+                    old = lines[h + 1:end]
+                    saved.append([name, old, False])
+                    tail = 0                             # your blank lines after it stay as they were
+                    while tail < len(old) and not old[len(old) - 1 - tail].strip():
+                        tail += 1
+                    new = list(body)
+                    while new and not new[-1].strip():
+                        new.pop()
+                    lines[h + 1:end] = new + [""] * tail
+                else:
+                    blank = bool(lines and lines[-1].strip())
+                    if blank:
+                        lines.append("")
+                    new = list(body)
+                    while new and not new[-1].strip():
+                        new.pop()
+                    lines.extend([f"[{name}]"] + new)
+                    saved.append([name, None, blank])
+                wrote[name] = new
+                touched.add(name.lower())
+            if sections:
+                self.state["input_preset"] = {"mid": want["id"], "sig": sig, "saved": saved, "wrote": wrote}
+        return touched
+
     def _write_input_settings(self):
         """Add each enabled mod's keybind lines, and take back out exactly what we added."""
         tracked = self.state.setdefault("keybinds", {})
@@ -10146,6 +13656,7 @@ class ModManager:
         self.state["input_settings_found"] = True
         raw, bom, nl, final = self._read_settings_text(path)
         lines = _settings_split(raw[len(bom):])
+        preset_touched = self._input_preset_step(lines, tracked)
 
         def section_end(name):
             """Index just after the last non-empty line of a section, creating it if needed."""
@@ -10208,6 +13719,8 @@ class ModManager:
         for mid, entries in tracked.items():
             for e in entries:
                 section, now, solo, _orig = e
+                if section.lower() in preset_touched:
+                    continue                             # a preset just took or gave back this section
                 have = in_section(section)
                 if now in have or not solo or not action(now):
                     continue
@@ -10215,6 +13728,17 @@ class ModManager:
                 if len(moved) == 1:
                     e[1] = moved[0]
 
+        # a key you rebound for a mod that's switched off is remembered, and it comes back on that
+        # key when the mod is on again; forgotten once the mod is uninstalled
+        rebound = self.state.setdefault("keybinds_kept", {})
+        for mid in list(rebound):
+            owner = self.get(mid)
+            if owner is not None:
+                # a key the mod no longer brings (a new version changed it): nothing to put back
+                gives = {f"{sec.lower()}\n{l}" for sec, ls in (owner.get("keybind_lines") or {}).items() for l in ls}
+                rebound[mid] = {k: v for k, v in rebound[mid].items() if k in gives}
+            if owner is None or not rebound[mid]:
+                rebound.pop(mid)
         # take out lines we added for mods that are gone, off, or no longer bring them
         for mid, entries in list(tracked.items()):
             keep = []
@@ -10223,6 +13747,9 @@ class ModManager:
                     keep.append(e)
                 else:
                     remove_line(e[0], e[1])
+                    owner = self.get(mid)
+                    if owner and e[1] != e[3] and e[3] in ((owner.get("keybind_lines") or {}).get(e[0]) or []):
+                        rebound.setdefault(mid, {})[f"{e[0].lower()}\n{e[3]}"] = e[1]
             if keep:
                 tracked[mid] = keep
             else:
@@ -10237,17 +13764,22 @@ class ModManager:
                     mine = next((e for e in entries if e[0].lower() == section.lower() and e[3] == line), None)
                     if mine is not None and mine[1] in present:
                         continue                  # ours, maybe on the key you rebound it to
+                    # on the key you'd rebound it to before the mod was switched off
+                    use = (rebound.get(mid) or {}).pop(f"{section.lower()}\n{line}", None) or line
+                    if mine is None and use != line and use in present:
+                        entries.append([section, use, True, line])
+                        continue                  # its rebound line is there already: ours again
                     if mine is None and line in present:
                         continue                  # already there — yours or the game's, not ours
                     # the same key already does something else here (the game's own binding, or
                     # yours): both would fire. Still added — mods sometimes mean it — but flagged
                     solo = not any(action(l) == action(line) for l in present)
-                    lines.insert(section_end(section), line)
-                    present.append(line)
+                    lines.insert(section_end(section), use)
+                    present.append(use)
                     if mine is None:
-                        entries.append([section, line, solo, line])
+                        entries.append([section, use, solo, line])
                     else:
-                        mine[1] = line
+                        mine[1] = use
             if not entries:
                 tracked.pop(mid)
 
@@ -10284,10 +13816,748 @@ class ModManager:
 
     USER_FILES = ("user.settings", "dx12user.settings")
 
+    # --- a mod's menu, edited from the app (MenuSettingsDialog)
+    def ingame_settings_file(self):
+        """The settings file the game you play reads its menus from: user.settings for the classic
+        game, dx12user.settings for 5.00 and later (DX12 only), and for 4.x the one the game wrote
+        last (its DX11 build keeps user.settings, its DX12 build dx12user.settings, each written
+        when the game closes). None when neither is there yet."""
+        sdir = self.settings_dir()
+        if not sdir:
+            return None
+        have = {f: p for f in self.USER_FILES for p in [ci_child(sdir, f)] if p and p.is_file()}
+        if not have:
+            return None
+        gen = self.generation()
+        if gen == "og" and "user.settings" in have:
+            return have["user.settings"]
+        if gen == "rem" and "dx12user.settings" in have:
+            return have["dx12user.settings"]
+        return max(have.values(), key=lambda p: p.stat().st_mtime)
+
+    def _settings_values(self, path):
+        """{(section lower, key lower): value} of a settings file (a key twice: the last one)."""
+        values, section = {}, None
+        if not path or not path.is_file():
+            return values
+        raw, bom, _nl, _final = self._read_settings_text(path)
+        for line in _settings_split(raw[len(bom):]):
+            head = INI_SECTION.match(line)
+            if head:
+                section = head.group(1).strip().lower()
+                continue
+            kv = SETTING_LINE.match(line)
+            if kv and section:
+                values[(section, kv.group(1).lower())] = kv.group(2).strip()
+        return values
+
+    def game_text_language(self):
+        """The game's text language as its .w3strings files are named ("en", "pl", "esmx"…), from
+        [Localization] TextLanguage in the settings file the game reads; "en" when it isn't set."""
+        lang = self._settings_values(self.ingame_settings_file()).get(("localization", "textlanguage"), "")
+        return lang.strip().lower() if re.fullmatch(r"\s*[A-Za-z]{2,5}\s*", lang or "") else "en"
+
+    def _menu_strings(self, m, lang=None):
+        """{key hash: text} for a mod's menu labels, in the game's language: its .w3strings files
+        (that language first, then English, then any other for keys those lack) and plain-text
+        string tables (id|key|key name|text, as the w3strings encoder reads them; their language
+        from a ;meta[language=..] line or the file's name)."""
+        lang = (lang or self.game_text_language()).lower()
+        tiers = ({}, {}, {})                         # the game's language, English, the others
+        tier = lambda code: 0 if code == lang else 1 if code in ("en", "en_us") else 2
+        stage = self.stage_dir(m)
+        cache = self.__dict__.setdefault("_w3s_cache", {})
+        others = []                                  # read only when the mod has neither
+        for dp, _dn, files in os.walk(stage):
+            for f in files:
+                low = f.lower()
+                path = Path(dp, f)
+                try:
+                    if low.endswith(".w3strings"):
+                        if tier(low[:-len(".w3strings")]) == 2:
+                            others.append(path)
+                            continue
+                        tiers[tier(low[:-len(".w3strings")])].update(self._w3s_texts(path, cache))
+                    elif low.endswith((".csv", ".txt", ".strings")) and path.stat().st_size < 4_000_000:
+                        lines = decode_script(path.read_bytes())[0]
+                        meta = next((re.search(r"language\s*=\s*([A-Za-z_]+)", l) for l in lines[:20]
+                                     if l.lstrip().startswith(";") and "language" in l.lower()), None)
+                        code = meta.group(1).lower() if meta else low.split(".")[0]
+                        table = tiers[tier(code)]
+                        for line in lines:
+                            parts = line.split("|")
+                            if len(parts) < 4 or line.lstrip().startswith(";"):
+                                continue
+                            name, hexkey = parts[2].strip(), parts[1].strip()
+                            if name:
+                                h = str_key_hash(name)
+                            elif re.fullmatch(r"[0-9A-Fa-f]{1,8}", hexkey):
+                                h = int(hexkey, 16)
+                            else:
+                                continue
+                            table.setdefault(h, "|".join(parts[3:]).strip())
+                except (OSError, UnicodeError, ValueError):
+                    continue
+        if not tiers[0] and not tiers[1]:
+            for path in others:
+                try:
+                    tiers[2].update(self._w3s_texts(path, cache))
+                except (OSError, UnicodeError, ValueError):
+                    continue
+        out = {}
+        for t in tiers:
+            for k, v in t.items():
+                out.setdefault(k, v)
+        return out
+
+    def _menu_string_ids(self, m, lang=None):
+        """{string ID: text} of a mod's strings, for scripts that name them by number
+        (GetLocStringById): its .w3strings files and plain-text string tables, the game's language
+        first, then English, then any other."""
+        lang = (lang or self.game_text_language()).lower()
+        tiers = ({}, {}, {})
+        tier = lambda code: 0 if code == lang else 1 if code in ("en", "en_us") else 2
+        cache = self.__dict__.setdefault("_w3s_id_cache", {})
+        for dp, _dn, files in os.walk(self.stage_dir(m)):
+            for f in files:
+                low = f.lower()
+                path = Path(dp, f)
+                try:
+                    if low.endswith(".w3strings"):
+                        st = path.stat()
+                        key = (str(path), st.st_size, st.st_mtime_ns)
+                        if key not in cache:
+                            cache[key] = (w3strings_read(path.read_bytes(), texts=True) or {}).get("texts") or {}
+                        tiers[tier(low[:-len(".w3strings")])].update(cache[key])
+                    elif low.endswith((".csv", ".txt", ".strings")) and path.stat().st_size < 4_000_000:
+                        lines = decode_script(path.read_bytes())[0]
+                        meta = next((re.search(r"language\s*=\s*([A-Za-z_]+)", l) for l in lines[:20]
+                                     if l.lstrip().startswith(";") and "language" in l.lower()), None)
+                        table = tiers[tier(meta.group(1).lower() if meta else low.split(".")[0])]
+                        for line in lines:
+                            parts = line.split("|")
+                            if len(parts) >= 4 and re.fullmatch(r"\d+", parts[0].strip()):
+                                table.setdefault(int(parts[0].strip()), "|".join(parts[3:]).strip())
+                except (OSError, UnicodeError, ValueError):
+                    continue
+        out = {}
+        for t in tiers:
+            for k, v in t.items():
+                out.setdefault(k, v)
+        return out
+
+    def _texture_caches(self):
+        """The texture.cache files icons are looked up in, as the game would: the mods that are on
+        first, then the game's DLC and its own content."""
+        key = tuple((m["id"], bool(m.get("enabled"))) for m in self.mods)
+        hit = self.__dict__.get("_tc_list")
+        if hit and hit[0] == key:
+            return hit[1]
+        out = []
+        for m in self.mods:
+            if not m.get("enabled"):
+                continue
+            for dp, _dn, files in os.walk(self.stage_dir(m)):
+                out += [Path(dp, f) for f in files if f.lower() == "texture.cache"]
+        for top in ("dlc", "content"):
+            base = ci_child(self.game, top) if self.game else None
+            if base and base.is_dir():
+                for sub in sorted(kids(base)):
+                    for c in ([ci_path(sub, "content/texture.cache")] if top == "dlc" else [ci_child(sub, "texture.cache")]):
+                        if c and c.is_file():
+                            out.append(c)
+        self._tc_list = (key, out)
+        return out
+
+    def menu_image(self, src):
+        """(file, width, height) of an image a menu description names (img://icons/…/x.png), from
+        the first texture.cache that holds it, drawn once into the app's scratch folder; or None."""
+        rel = re.sub(r"^img://", "", src.strip(), flags=re.I).lower().replace("/", "\\")
+        caches = self._texture_caches()
+        memo = self.__dict__.get("_menu_images")
+        if not memo or memo[0] is not caches:                # mods switched on or off: looked up again
+            memo = self._menu_images = (caches, {})
+        done = memo[1]
+        if rel in done:
+            return done[rel]
+        got = None
+        for cache in caches:
+            rec = texture_cache_index(cache).get(rel)
+            if not rec:
+                continue
+            pixels = texture_cache_rgba(cache, rec)
+            if pixels:
+                w, h, rgba = pixels
+                folder = UI_DIR / "menu_icons"
+                folder.mkdir(parents=True, exist_ok=True)
+                out = folder / (hashlib.sha1(f"{cache}|{rel}".encode()).hexdigest()[:16] + ".png")
+                if not out.is_file():
+                    QImage(rgba, w, h, w * 4, QImage.Format.Format_RGBA8888).copy().save(str(out))
+                got = (str(out), w, h)
+            break
+        done[rel] = got
+        return got
+
+    def game_string(self, key_hash, lang=None):
+        """The game's own string for a key (its hash), in the game's language, else English; None
+        when it has none. Only that key is decoded (the game's files are large); kept once found."""
+        lang = (lang or self.game_text_language()).lower()
+        done = self.__dict__.setdefault("_game_strings", {})
+        if (lang, key_hash) in done:
+            return done[(lang, key_hash)]
+        hit = None
+        for code in dict.fromkeys((lang, "en")):
+            for top in ("content", "dlc"):
+                base = ci_child(self.game, top) if self.game else None
+                if not base or not base.is_dir():
+                    continue
+                for sub in sorted(kids(base)):
+                    f = ci_child(sub, f"{code}.w3strings") if top == "content" else ci_path(sub, f"content/{code}.w3strings")
+                    if f and f.is_file():
+                        hit = w3strings_lookup(f, {key_hash}).get(key_hash)
+                        if hit:
+                            break
+                if hit:
+                    break
+            if hit:
+                break
+        done[(lang, key_hash)] = hit
+        return hit
+
+    def all_strings(self, lang=None):
+        """{key hash: text} of every installed mod's strings (the mods that are on first), in the
+        game's language, worked out once per list of mods."""
+        lang = (lang or self.game_text_language()).lower()
+        key = (lang, tuple((m["id"], bool(m.get("enabled"))) for m in self.mods))
+        hit = self.__dict__.get("_all_strings")
+        if hit and hit[0] == key:
+            return hit[1]
+        out = {}
+        for m in sorted(self.mods, key=lambda m: not m.get("enabled")):
+            for k, v in self._menu_strings(m, lang).items():
+                out.setdefault(k, v)
+        self._all_strings = (key, out)
+        return out
+
+    @staticmethod
+    def _w3s_texts(path, cache):
+        """{key hash: text} of a .w3strings file, decoded once per change of the file."""
+        st = path.stat()
+        key = (str(path), st.st_size, st.st_mtime_ns)
+        if key not in cache:
+            cache[key] = (w3strings_read(path.read_bytes(), texts=True) or {}).get("key_texts") or {}
+        return cache[key]
+
+    def _script_texts(self, m):
+        """[(path, text)] of a mod's scripts (.ws), read once per change of the file."""
+        cache = self.__dict__.setdefault("_ws_cache", {})
+        out = []
+        stage = self.stage_dir(m)
+        for dp, _dn, files in os.walk(stage):
+            for f in files:
+                if not f.lower().endswith(".ws"):
+                    continue
+                path = os.path.join(dp, f)
+                try:
+                    st = os.stat(path)
+                    key = (path, st.st_size, st.st_mtime_ns)
+                    if key not in cache:
+                        data = open(path, "rb").read()
+                        wide = data.decode("utf-16", "ignore") if b"\x00" in data[:200] else ""
+                        hooks = ("MenuDescriptor", "SetDescriptionText", "OnShowOptionSubmenu", "GetGroupDisplayName",
+                                 "SU_onMenuEntered", "OptionSubmenu", "ScriptTag", "IsDLCEnabled", "OnOptionSelectionChanged",
+                                 "onHover", "inGameMenu_TryLocalize", "SetVarValue")
+                        cache[key] = ("\n".join(decode_script(data)[0])
+                                      if any(h.encode() in data or h in wide for h in hooks) else "")
+                    if cache[key]:
+                        out.append((path, cache[key]))
+                except (OSError, UnicodeError, ValueError):
+                    continue
+        return out
+
+    def menu_descriptions(self, mid, pages, lang=None, own_strings=None):
+        """The descriptions a mod's menu shows in the game, as its scripts give them: {'items':
+        {(section lower, setting lower): text}, 'pages': {section lower: the page's own text}}.
+        From Sharedutils' menu descriptors (or a copy of them under other names) in any installed
+        mod's scripts (a descriptor added for a menu id counts on that page and the pages under
+        it; one tied to no menu, on its own mod's pages), from a wrap of the game's
+        SetDescriptionText in the mod's own scripts, and from any of its scripts the game's menu
+        calls with the setting the pointer is on (WSTipTrace: whatever text that hands the game's
+        screens for one setting and not for every one). Texts in the game's language."""
+        m = self.get(mid)
+        out = {"items": {}, "pages": {}}
+        if not m or not pages:
+            return out
+        lang = lang or self.game_text_language()
+        strings = {mid: own_strings} if own_strings is not None else {}
+
+        def loc_of(owner):
+            def loc(key):
+                if owner["id"] not in strings:
+                    strings[owner["id"]] = self._menu_strings(owner, lang)
+                return strings[owner["id"]].get(str_key_hash(key)) or (strings.get(mid) or {}).get(str_key_hash(key)) or ""
+            return loc
+        numbered = {}
+
+        def loc_id_of(owner):
+            def loc_id(n):
+                for o in (owner, m):
+                    if o["id"] not in numbered:
+                        numbered[o["id"]] = self._menu_string_ids(o, lang)
+                    if n in numbered[o["id"]]:
+                        return numbered[o["id"]][n]
+                return ""
+            return loc_id
+
+        def text_of(raw, key, owner):
+            """A descriptor's text: its key's string when it names one, else its text; both
+            worked out from the script's source (a literal, or built by its functions)."""
+            ev = WSStringEval(functions.get(owner["id"], {}), loc_of(owner), loc_id_of(owner), lang=lang)
+            key = ev.eval(key) if key else ""
+            if key is None:
+                key = ""
+            raw = ev.eval(raw) if raw else ""
+            return text_key(key, owner) if key else (raw or "")
+
+        def text_key(key, owner):
+            if key:
+                if owner["id"] not in strings:
+                    strings[owner["id"]] = self._menu_strings(owner, lang)
+                hit = strings[owner["id"]].get(str_key_hash(key)) or strings.get(mid, {}).get(str_key_hash(key))
+                if hit is None and owner["id"] != mid:
+                    if mid not in strings:
+                        strings[mid] = self._menu_strings(m, lang)
+                    hit = strings[mid].get(str_key_hash(key))
+                return hit or ""
+            return ""
+        # Sharedutils' descriptors: from every installed mod (one mod can describe another's menu)
+        classes, menus, functions = {}, [], {}
+        for o in self.mods:
+            for _path, text in self._script_texts(o):
+                if "MenuDescriptor" not in text and "onHover" not in text:
+                    continue
+                got = parse_menu_descriptors(text)
+                functions.setdefault(o["id"], {}).update(got["functions"])
+                for name, rec in got["classes"].items():
+                    classes[name] = (rec, o)
+                menus += [(menu, cls, o) for menu, cls in got["menus"]]
+
+        def is_descriptor(name, seen=()):
+            """Sharedutils' kind, or a copy: a class (or one it extends) that lists settings it
+            describes."""
+            rec = classes.get(name)
+            if not rec or name in seen:
+                return False
+            base = rec[0]["base"]
+            return base == "SU_MenuDescriptor" or bool(rec[0]["hover"]) or is_descriptor(base, seen + (name,))
+
+        def hovers(name, seen=()):
+            rec = classes.get(name)
+            if not rec or name in seen:
+                return []
+            return rec[0]["hover"] + hovers(rec[0]["base"], seen + (name,))
+        tied = {cls for _menu, cls, _o in menus}
+        loose = [(None, cls, rec[1]) for cls, rec in classes.items()     # tied to no menu: its own mod's pages
+                 if cls not in tied and rec[1]["id"] == mid and rec[0]["hover"] and is_descriptor(cls)]
+        for page in pages:
+            segs = {p.lower() for p in page["path"]}
+            g = page["group"].lower()
+            fallback = ""
+            for menu, cls, _o in menus + loose:
+                if (menu is not None and menu.lower() not in segs) or not is_descriptor(cls):
+                    continue
+                rec, owner = classes[cls]
+                for setting, raw, key in hovers(cls):
+                    it = next((it for it in page["items"] if it.get("id", "").lower() == setting.lower()), None)
+                    t = text_of(raw, key, owner) if it else ""
+                    if t:
+                        k = menu_item_key(page, it)
+                        out["items"][k] = out["items"].get(k, "") + t
+                if rec["fallback"] and menu is not None:
+                    fallback += text_of(rec["fallback"][0], rec["fallback"][1], owner)
+            if fallback:
+                out["pages"][g] = fallback
+        # a wrap of SetDescriptionText in the mod's own scripts
+        for _path, text in self._script_texts(m):
+            if "SetDescriptionText" not in text:
+                continue
+            for prefix, lower, group in parse_description_hooks(text):
+                for page in pages:
+                    if group and not page["group"].lower().startswith(group.lower()):
+                        continue
+                    for it in page["items"]:
+                        if not it.get("id") or menu_item_key(page, it) in out["items"]:
+                            continue
+                        t = text_key(prefix + (it["id"].lower() if lower else it["id"]), m)
+                        if t:
+                            out["items"][menu_item_key(page, it)] = t
+        # a wrap of OnOptionSelectionChanged that shows a note for the setting selected (Minimalist Witcher
+        # Senses): the game names only the setting, so it's matched by its id among the mod's own
+        for _path, text in self._script_texts(m):
+            if "OnOptionSelectionChanged" not in text:
+                continue
+            keys = parse_selection_help(text)
+            if not keys:                                # its key function in another of the mod's scripts
+                keys = parse_selection_help(text, "\n".join(t for _p, t in self._all_script_texts(m)))
+            for page in pages:
+                for it in page["items"]:
+                    k = menu_item_key(page, it)
+                    if it.get("id") and k not in out["items"] and it["id"].lower() in keys:
+                        t = text_key(keys[it["id"].lower()], m)
+                        if t:
+                            out["items"][k] = t
+        # any other script the game's menu calls with the setting the pointer is on: followed for
+        # each setting still without a text, as the game would run it
+        hooks = [(path, hook) for path, text in self._script_texts(m) for hook in parse_option_hooks(text)]
+        if hooks:
+            texts = dict(self._script_texts(m))
+            own = strings.get(mid)
+            if own is None:
+                own = strings[mid] = self._menu_strings(m, lang)
+            rest = []
+
+            def more():
+                if not rest:
+                    rest.append({})
+                    for _p, t in self._all_script_texts(m):
+                        rest[0].update(parse_ws_functions(_ws_strip_comments(t)))
+                return rest[0]
+            for path, hook in hooks:
+                trace = WSTipTrace(dict(parse_ws_functions(_ws_strip_comments(texts[path]))), loc_of(m), loc_id_of(m), more, lang)
+                for page in pages:
+                    for it in page["items"]:
+                        k = menu_item_key(page, it)
+                        if not it.get("id") or k in out["items"] or it.get("kind") == "SEPARATOR":
+                            continue
+                        label = menu_label(own, "item", it.get("name") or it["id"], it.get("tags") or ())
+                        got = [t for t in trace.tips(hook, it["id"]) if t.strip() != label.strip()]
+                        if got:
+                            out["items"][k] = "<br>".join(got)
+        return out
+
+    def _all_script_texts(self, m):
+        """[(path, text)] of every script of a mod, read when asked (not kept)."""
+        out = []
+        for dp, _dn, files in os.walk(self.stage_dir(m)):
+            for f in files:
+                if f.lower().endswith(".ws"):
+                    try:
+                        out.append((os.path.join(dp, f), "\n".join(decode_script(Path(dp, f).read_bytes())[0])))
+                    except (OSError, UnicodeError, ValueError):
+                        continue
+        return out
+
+    def _kept_holders(self, m, create=False):
+        """Where the app keeps a mod's menu values while its menu is out of the game, each
+        {settings file name: kept lines}: its own (its menu or the mod switched off; see
+        _menu_switched), and those kept for every mod while all mods are off (turn_all_off), or
+        still waiting to go back after (menu_restore). create: start its own when its menu is
+        off, so values saved now are the ones that come back."""
+        out = []
+        if m.get("menu_kept") or (create and not self._snippet_on(m, "menu")):
+            out.append(m.setdefault("menu_kept", {}))
+        if self._snippet_on(m, "menu"):                # its menu comes back with all mods
+            st = self.state.get("mods_off")
+            if st:
+                out.append(st.setdefault("menu_values", {}) if create else st.get("menu_values") or {})
+            elif self.state.get("menu_restore"):
+                out.append(self.state["menu_restore"])
+        return out
+
+    def _kept_values(self, m, fname):
+        """{(section lower, key lower): value} of a mod's menu values the app keeps while its menu
+        is out of the game (switched off, or all mods off), for one settings file."""
+        out = {}
+        for holder in reversed(self._kept_holders(m)):   # its own last: it wins
+            for sec in (holder.get(fname) or {}).get("sections", []):
+                for e in sec.get("body", []):
+                    kv = SETTING_LINE.match(e[1]) if e[0] else None
+                    if kv:
+                        out[(sec["name"].lower(), kv.group(1).lower())] = kv.group(2).strip()
+        return out
+
+    def _dlc_ids(self):
+        """The names of the DLCs in the game's dlc folder, the game's own and mods', as scripts ask
+        for them (IsDLCEnabled('dlcbia')): each folder's metadata.store lists its definition,
+        dlc\\<name>\\<name>.reddlc (Brothers In Arms' folder dlcbrothersinarms holds dlcbia)."""
+        ids, cache = set(), self.__dict__.setdefault("_dlc_id_cache", {})
+        top = ci_path(self.game, "dlc")
+        for sub in (sorted(top.iterdir()) if top.is_dir() else []):
+            store = ci_path(sub, "content/metadata.store") if sub.is_dir() else None
+            try:
+                st = store.stat() if store else None
+            except OSError:
+                st = None
+            if st is None:
+                continue
+            key = (str(store), st.st_size, st.st_mtime_ns)
+            if key not in cache:
+                try:
+                    data = store.read_bytes()
+                except OSError:
+                    data = b""
+                cache[key] = {x.decode("ascii", "ignore").lower() for x in re.findall(rb"([A-Za-z0-9_]+)\.reddlc", data)}
+            ids |= cache[key]
+        return ids
+
+    def script_tag_states(self):
+        """{tag (lower): on} for the visibility conditions mods' menus use that a script of a mod
+        that's on switches (ActivateScriptTag / DeactivateScriptTag) in a way the app can follow:
+        by whether a DLC is installed (Rational UI shows its Tawny Owl formula only without Brothers
+        In Arms, whose DLC adds the formula itself). A tag switched any other way isn't listed:
+        such a setting stays shown, nothing guessed."""
+        code = "\n".join(_ws_strip_comments(t) for m in self.mods if m.get("enabled")
+                         for _p, t in self._script_texts(m) if "ScriptTag" in t or "IsDLCEnabled" in t)
+        if "ScriptTag" not in code:
+            return {}
+        dlc_of = {name.lower(): dlc.lower() for name, dlc in re.findall(
+            r"function\s+(\w+)\s*\([^)]*\)\s*:\s*bool\s*\{\s*return\s+theGame\.GetDLCManager\(\)\.IsDLCEnabled\(\s*['\"](\w+)['\"]\s*\)\s*;\s*\}",
+            code)}
+        ids = self._dlc_ids()
+
+        def value(cond):
+            cond = cond.strip()
+            neg = cond.startswith("!")
+            cond = cond.lstrip("!").strip()
+            call = re.fullmatch(r"(\w+)\s*\(\s*\)", cond)
+            direct = re.fullmatch(r"theGame\.GetDLCManager\(\)\.IsDLCEnabled\(\s*['\"](\w+)['\"]\s*\)", cond)
+            dlc = direct.group(1).lower() if direct else dlc_of.get(call.group(1).lower()) if call else None
+            if dlc is None:
+                return None
+            return (dlc not in ids) if neg else (dlc in ids)
+        states, unsure = {}, set()
+        for m in re.finditer(r"\bif\s*\((?P<c>[^{}]*?)\)\s*\{(?P<a>[^{}]*)\}\s*else\s*\{(?P<b>[^{}]*)\}", code):
+            v = value(m.group("c"))
+            for block, when in ((m.group("a"), True), (m.group("b"), False)):
+                for act, tag in re.findall(r"\b(Activate|Deactivate)ScriptTag\(\s*['\"](\w+)['\"]\s*\)", block):
+                    if v is None:
+                        unsure.add(tag.lower())
+                    elif v == when:
+                        on = act == "Activate"
+                        if states.get(tag.lower(), on) != on:
+                            unsure.add(tag.lower())           # two scripts disagree: can't tell
+                        states[tag.lower()] = on
+        return {k: v for k, v in states.items() if k not in unsure}
+
+    def menu_localizer(self, mid, lang, loc):
+        """The game's inGameMenu_TryLocalize as mods change it, for a menu's names: a function
+        (key -> text, or None) running the mod's own version of it, then those of the other mods
+        that are on, as the game would run them (Food Rebalance gives its settings their names
+        this way, in each language, with no strings at all). A key a version doesn't answer itself
+        (it hands it to the game's own) gives None, and the names come from the strings as before.
+        None when no mod changes it."""
+        m = self.get(mid)
+        hooks = []
+        for o in ([m] + [x for x in self.mods if x.get("enabled") and x is not m]) if m else []:
+            texts = [t for _p, t in self._script_texts(o) if "inGameMenu_TryLocalize" in t]
+            if not any(re.search(r"\bfunction\s+inGameMenu_TryLocalize\s*\(", _ws_strip_comments(t)) for t in texts):
+                continue
+            functions = dict(parse_ws_functions("\n".join(_ws_strip_comments(t) for _p, t in self._all_script_texts(o))))
+            if "inGameMenu_TryLocalize" in functions:
+                hooks.append(functions)
+        if not hooks:
+            return None
+        cache = {}
+
+        def localize(key):
+            if key not in cache:
+                cache[key] = None
+                for functions in hooks:
+                    ev = WSStringEval(functions, loc, lang=lang)
+                    try:
+                        got = ev._call("inGameMenu_TryLocalize", [key])
+                    except (ValueError, RecursionError, IndexError, TypeError):
+                        continue
+                    if isinstance(got, str) and got.strip() and not got.startswith("#"):   # "##key": none
+                        cache[key] = got.replace("\xa0", " ").strip()
+                        break
+            return cache[key]
+        return localize
+
+    def menu_script_defaults(self, m):
+        """{(section lower, key lower): value} a mod's own scripts write into its menu's settings:
+        Food Rebalance writes its defaults when the game starts or its menu is opened, so until
+        then the settings file has none. Every SetVarValue('Section', 'Key', "value") in its
+        scripts, worked out as the game would run it (in a function of the mod's own: from each
+        place that calls it); a key only when every write there gives the same value. {} when a
+        write's key can't be worked out (it might be any of them): nothing guessed."""
+        if not any("SetVarValue" in t for _p, t in self._script_texts(m)):
+            return {}
+        code = "\n".join(_ws_strip_comments(t) for _p, t in self._all_script_texts(m))
+        functions = parse_ws_functions(code)
+        found, unsure = {}, set()
+
+        def note(args, env):
+            ev = WSStringEval(functions, lambda _k: "")
+            sec, key = ev._run_expr(args[0], env), ev._run_expr(args[1], env)
+            val = ev._run_expr(args[2], env)
+            if not isinstance(sec, str) or not isinstance(key, str) or not sec or not key:
+                return False
+            k = (sec.lower(), key.lower())
+            if isinstance(val, bool):
+                val = "true" if val else "false"
+            if isinstance(val, str):
+                found.setdefault(k, set()).add(val)
+            else:
+                unsure.add(k)
+            return True
+        for name, (params, body) in functions.items():
+            for c in re.finditer(r"\.\s*SetVarValue\s*\(", body):
+                args, _end = _ws_args(body, c.end() - 1)
+                if len(args) < 3:
+                    return {}
+                used = [p for p in params if any(re.search(r"\b" + re.escape(p) + r"\b", a) for a in args[:3])]
+                if not used:
+                    if not note(args, {}):
+                        return {}
+                    continue
+                calls = [x for x in re.finditer(r"(?<![\w.])" + re.escape(name) + r"\s*\(", code)
+                         if not re.search(r"(?:function|event)\s+$", code[max(0, x.start() - 20):x.start()])]
+                if not calls:
+                    return {}                     # called from somewhere else: its values can't be known
+                for x in calls:
+                    cargs, _e = _ws_args(code, x.end() - 1)
+                    env = {}
+                    for i, p in enumerate(params):
+                        v = WSStringEval(functions, lambda _k: "")._run_expr(cargs[i], {}) if i < len(cargs) else None
+                        if v is not None:
+                            env[p] = v
+                    if not note(args, env):
+                        return {}
+        return {k: next(iter(v)) for k, v in found.items() if len(v) == 1 and k not in unsure}
+
+    def menu_model(self, mid):
+        """A mod's in-game menu as the app shows it: {'pages': [parse_mod_menu pages, its menu files
+        together], 'strings': {key hash: text}, 'lang', 'file': the settings file the game reads,
+        'values': {(section lower, key lower): value as the game has it now}, 'kept': the keys whose
+        value came from what the app keeps while the mod's menu is out of the game}. A value the
+        file doesn't have comes from what the app keeps for the mod, else the menu's default
+        (worked out in the window). None when the mod has no menu or it can't be read."""
+        m = self.get(mid)
+        if not m:
+            return None
+        pages = []
+        for name in self.menu_files(m):
+            path = ci_path(self.stage_dir(m), f"{FILELIST_DIR}/{name}")
+            try:
+                pages += parse_mod_menu(path.read_bytes())
+            except (OSError, ValueError):
+                continue
+        if not pages:
+            return None
+        path = self.ingame_settings_file()
+        values = self._settings_values(path)
+        kept = {k: v for k, v in self._kept_values(m, path.name if path else "dx12user.settings").items() if k not in values}
+        if not path:                                      # no settings file yet: what the app keeps, from either
+            for fname in self.USER_FILES:
+                for k, v in self._kept_values(m, fname).items():
+                    kept.setdefault(k, v)
+        lang = self.game_text_language()
+        strings = LayeredStrings(self._menu_strings(m, lang), lambda: self.all_strings(lang),
+                                 lambda h: self.game_string(h, lang))
+        strings.localize = self.menu_localizer(mid, lang, lambda k: strings.get(str_key_hash(k)) or "")
+        written = self.menu_script_defaults(m)
+        for page in pages:
+            for it in page["items"]:
+                v = written.get(menu_item_key(page, it))
+                if v is not None and not it.get("given") and menu_value_fits(it, v):
+                    # the value the mod's own scripts give it, as the game shows once they ran
+                    it.update(default=v, given=True, from_script=True)
+        return {"pages": pages, "strings": strings, "lang": lang, "menu_on": bool(self.snippet_on(m, "menu")),
+                "descriptions": self.menu_descriptions(mid, pages, lang, strings),
+                "conditions": self.script_tag_states() if any(it.get("condition") for p in pages for it in p["items"]) else {},
+                "file": path.name if path else None, "values": {**kept, **values}, "kept": set(kept)}
+
+    def save_menu_values(self, changes, mid=None):
+        """Write menu values ({(section, key): value}) into user.settings and dx12user.settings, as
+        the game's menu would: a key there is changed in place (in each section of that name it
+        is in), a missing one goes at the end of its section, a missing section at the end of the
+        file. With mid: what the app keeps for that mod while its menu is out of the game gets the
+        new values too, so they're the ones that come back. Never while the game runs (it writes
+        these files when it closes), nor before the game made its settings file. Returns how many
+        files changed."""
+        if game_running():
+            raise RuntimeError("The game is running. Close it first: it writes these files when it closes.")
+        sdir = self.settings_dir()
+        files = [p for f in self.USER_FILES for p in [ci_child(sdir, f) if sdir else None] if p and p.is_file()]
+        if not files:
+            raise RuntimeError("No settings file yet. Start the game once first.")
+        done = 0
+        for path in files:
+            raw, bom, nl, final = self._read_settings_text(path)
+            lines = _settings_split(raw[len(bom):])
+            for (section, key), value in changes.items():
+                heads = [i for i, line in enumerate(lines) if INI_SECTION.match(line)]
+                spans = []
+                for n, i in enumerate(heads):
+                    if INI_SECTION.match(lines[i]).group(1).strip().lower() == section.lower():
+                        spans.append((i, heads[n + 1] if n + 1 < len(heads) else len(lines)))
+                if not spans:
+                    gap = settings_gapped(lines)                  # the file's own style (the game's has no gaps)
+                    while lines and not lines[-1].strip():
+                        lines.pop()
+                    if lines and gap:
+                        lines.append("")
+                    lines += [f"[{section}]", f"{key}={value}"]
+                    continue
+                hits = [i for start, end in spans for i in range(start + 1, end)
+                        if (lambda kv: kv and kv.group(1).lower() == key.lower())(SETTING_LINE.match(lines[i]))]
+                for i in hits:
+                    lines[i] = f"{SETTING_LINE.match(lines[i]).group(1)}={value}"
+                if not hits:
+                    start, end = spans[0]
+                    at = end
+                    while at - 1 > start and not lines[at - 1].strip():
+                        at -= 1
+                    lines.insert(at, f"{key}={value}")
+            new_raw = bom + nl.join(lines) + (nl if final and lines else "")
+            if new_raw != raw:
+                self._write_settings_text(path, raw, new_raw)
+                done += 1
+        m = self.get(mid) if mid else None
+        holders = self._kept_holders(m, create=True) if m else []
+        for holder in holders:
+            # its menu is out of the game: the game drops these when it runs without it, so they're
+            # kept too, and go back with its menu (_menu_back, or with all mods: menu_restore)
+            self._kept_update(m, holder, changes, files)
+        if holders:
+            self.save()
+        return done
+
+    def _kept_update(self, m, holder, changes, files):
+        """New menu values into what the app keeps for a mod while its menu is out of the game
+        (holder: see _kept_holders): a kept line changed in place, a missing one added to its
+        section, a missing section added after the last section the file has now (where
+        _restore_menu_values puts it back)."""
+        game_groups = self._menu_owned([m])[1]
+        for path in files:
+            rec = holder.setdefault(path.name, {"sections": [], "readme": [], "final": True})
+            for (section, key), value in changes.items():
+                sec = next((x for x in rec["sections"] if x["name"].lower() == section.lower()), None)
+                if sec is None:
+                    raw, bom, _nl, _final = self._read_settings_text(path)
+                    seen = []
+                    for line in _settings_split(raw[len(bom):]):
+                        head = INI_SECTION.match(line)
+                        if head:
+                            name = head.group(1).strip()
+                            seen.append([name, sum(1 for n, _k in seen if n.lower() == name.lower())])
+                    sec = {"name": section, "nth": 0, "header": f"[{section}]", "prevs": list(reversed(seen)),
+                           "blank_before": settings_gapped(_settings_split(raw[len(bom):])), "blank_after": False,
+                           "shared": section.lower() in game_groups, "body": []}
+                    rec["sections"].append(sec)
+                hit = next((e for e in sec["body"] if e[0] and e[0].lower() == key.lower()), None)
+                if hit:
+                    hit[1] = f"{hit[0]}={value}"
+                else:
+                    last = next((e[0] for e in reversed(sec["body"]) if e[0]), None)
+                    sec["body"].append([key, f"{key}={value}", last, True])
+
     def _menu_xml_groups(self, data):
         """{group id (lower): set of keys (lower)} a menu XML file writes to user.settings: each
-        <Group id="…"> is a section, its <Var id="…"> the keys; a preset's <Entry overrideGroup="…"
-        varId="…"> writes a key into another section. {} when it isn't XML (nothing guessed)."""
+        <Group id="…"> is a section, its <Var id="…"> the keys (in the section a Var's own
+        overrideGroup names, when it has one); a preset's <Entry overrideGroup="…" varId="…"> writes
+        a key into another section. {} when it isn't XML (nothing guessed)."""
         import xml.etree.ElementTree as ET
         if len(data) > 4_000_000:
             return {}
@@ -10299,9 +14569,11 @@ class ModManager:
         out = {}
         for g in root.iter("Group"):
             gid = (g.get("id") or "").strip()
-            keys = {(v.get("id") or "").strip().lower() for v in g.iter("Var")} - {""}
-            if gid and keys:
-                out.setdefault(gid.lower(), set()).update(keys)
+            for v in g.iter("Var"):
+                # a setting with its own overrideGroup keeps its value in that section
+                var, section = (v.get("id") or "").strip(), (v.get("overrideGroup") or gid).strip()
+                if var and section:
+                    out.setdefault(section.lower(), set()).add(var.lower())
         for e in root.iter("Entry"):
             gid, var = (e.get("overrideGroup") or "").strip(), (e.get("varId") or "").strip()
             if gid and var:
@@ -10514,9 +14786,19 @@ class ModManager:
         backup = self.root / f"{path.name}.original"
         if not backup.exists():
             shutil.copy2(path, backup)
+        # 4.x: the file the game reads is the one it wrote last (ingame_settings_file), so writing
+        # the other one mustn't make it the newer: it keeps its place just behind
+        newest = self.ingame_settings_file() if self.generation() == "ng" else None
         tmp = path.with_name(path.name + ".w3mm-tmp")
         tmp.write_bytes(new_raw.encode("utf-8", errors="surrogateescape"))
         os.replace(tmp, path)
+        if newest is not None and newest != path:
+            try:
+                t = newest.stat().st_mtime_ns
+                if path.stat().st_mtime_ns >= t:
+                    os.utime(path, ns=(path.stat().st_atime_ns, t - 1_000_000))
+            except OSError:
+                pass
 
     def _write_user_settings(self):
         """Add each enabled mod's user.settings lines (from its readme) to user.settings and
@@ -10544,9 +14826,10 @@ class ModManager:
         if game_running():
             self.state["settings_waiting"] = True
             return
-        hints = {}                                  # where lines below sat before all mods went off
+        hints = getattr(self, "_menu_hints", {})    # where lines below sat before their mods went off
+        self._menu_hints = {}
         if self.state.get("menu_restore"):
-            hints = self._restore_menu_values(self.state["menu_restore"])
+            hints = {**hints, **self._restore_menu_values(self.state["menu_restore"])}
             self.state.pop("menu_restore", None)
         # a value with ':' or ';' in it is never added: the game cuts a value at ':', and with such a
         # value followed by more lines it threw the whole file away and reset every setting
@@ -10625,7 +14908,7 @@ class ModManager:
                     continue
                 where = find(section)
                 if where is None:
-                    blank = bool(lines and lines[-1].strip())
+                    blank = bool(lines and lines[-1].strip()) and settings_gapped(lines)   # the file's own style
                     if blank:
                         lines.append("")
                     lines.append(f"[{section}]")
@@ -10688,8 +14971,21 @@ class ModManager:
             d["settings_pending"] = pending
             if waiting and self.snippet_on(m, "input") and m.get("keybind_lines") and not d["keys_added"]:
                 d["keys_pending"] = True
-            data = {"user": m.get("user_settings"), "input_xml": m.get("input_xml"), "input": m.get("keybind_lines")}
-            d["settings_off"] = [k for k in ("user", "input", "input_xml")
+            data = {"user": m.get("user_settings"), "input_xml": m.get("input_xml"), "input": m.get("keybind_lines"),
+                    "input_preset": m.get("input_preset")}
+            # a keybind preset: in (its sections are the ones in input.settings), not used (another
+            # preset ranks higher), or waiting (no input.settings yet, or the game is running)
+            pre = self.state.get("input_preset") or {}
+            d["preset"] = None
+            if m.get("input_preset") and self.snippet_on(m, "input_preset"):
+                if pre.get("mid") == m["id"]:
+                    d["preset"] = ("in", len(pre.get("wrote") or {}))
+                else:
+                    top = next((o for o in self.ranked if o.get("input_preset") and self.snippet_on(o, "input_preset")), None)
+                    d["preset"] = ("other", top["name"]) if top and top["id"] != m["id"] else (
+                        "wait", "The game is running. It goes in once it's closed." if waiting
+                        else "No input.settings yet. Start the game once and it goes in.")
+            d["settings_off"] = [k for k in ("user", "input", "input_preset", "input_xml")
                                  if m["enabled"] and data[k] and k in m.get("snippets_off", ())]
             d["settings_source"] = list(dict.fromkeys(m.get("snippet_source") or []))
             d["settings_blocked"] = (self.state.get("user_blocked") or {}).get(m["id"], []) \
@@ -10775,8 +15071,12 @@ class ModManager:
                     if k.startswith((XML_KEY, INI_KEY)) and r["status"] in ("merged", "superset", "same", "added")}
         for m in self.mods:
             if m["enabled"]:
-                info[m["id"]]["lost"] = sum(1 for rel in self.live_files(m)
+                live = self.live_files(m)
+                info[m["id"]]["lost"] = sum(1 for rel in live
                                             if winner.get(rel.lower()) != m["id"] and rel.lower() not in combined)
+                # its files, to tell how much of it is overridden: a bundle and its metadata.store
+                # (and the game's caches) only hold the files packed in them, which count instead
+                info[m["id"]]["file_total"] = sum(1 for rel in live if not _CONTAINER.search(rel))
         # files packed in bundles that another loaded folder packs too: the higher one wins
         for d in info.values():
             d["packed"] = {}
@@ -10791,7 +15091,7 @@ class ModManager:
             if low == AUTO_MERGE_NAME.lower():
                 continue
             for r in res:
-                if r[0] == "packed" and r[1] not in settled:
+                if r[0] == "packed" and r[1] not in settled and r not in cl.get("identical", ()):
                     holders.setdefault(r[1], []).append((order.get(low, len(order)), name, mid, low))
         # how many files of each kind (extension) each mod packs, for "Textures 3/10" in its tooltip
         for d in info.values():
@@ -10800,7 +15100,10 @@ class ModManager:
         for low, (name, mid, res) in cl["folders"].items():
             if mid in info:
                 own.setdefault(mid, set()).update(r[1] for r in res if r[0] == "packed" and not r[1].startswith(TEXT_ID))
+        for d in info.values():
+            d["packed_total"] = 0
         for mid, paths in own.items():
+            info[mid]["packed_total"] = len(paths)
             totals = info[mid]["packed_totals"]
             for path in paths:
                 ext = Path(path).suffix.lower()
@@ -10817,8 +15120,12 @@ class ModManager:
                                                  "top_folder": top[3]}
         # the same symbol added (or taken over) through annotations in two mods' own files:
         # flagged on the mod that arrived last, like a script decision
+        breaks = self.compile_breaks()
         for d in info.values():
             d["annot"] = []
+        for mid, found in breaks.items():
+            if mid in info:
+                info[mid]["breaks"] = found
         for key, owners in self.annotation_clashes().items():
             ids = [mid for _label, mid in owners if mid in info]
             if not ids:
@@ -10826,7 +15133,26 @@ class ModManager:
             last = max(ids, key=lambda i: (arrived.get(i, 0), place.get(i, 0)))
             others = [names.get(mid) or label.replace(" (not managed here)", "")
                       for label, mid in owners if mid != last]
-            info[last]["annot"].append((key, others))
+            info[last]["annot"].append((key, others, key in getattr(self, "_red_blob_only", ())))
+        # a function a precompiled mod replaces or adds that loose scripts change too: the
+        # precompiled one is used whatever the priority, so it's noted on the mods that lose it
+        for d in info.values():
+            d["pre_used"], d["pre_wrap"], d["blob_of"] = [], [], {}
+        nm = lambda label, mid: names.get(mid) or label.replace(" (not managed here)", "")
+        for shown, rec in self.precompiled_wins().items():
+            winners = [nm(l, i) for l, i in rec["winner"]]
+            for label, mid, how in rec["losers"]:
+                if mid in info:
+                    info[mid]["pre_used"].append((shown, how, winners, rec.get("files", {}).get(mid or label, [])))
+                    # whose precompiled version is used, to show it (MainWindow.view_blob)
+                    if rec["winner"] and rec["winner"][0][1]:
+                        info[mid]["blob_of"][shown] = rec["winner"][0][1]
+        # a precompiled mod's wrapper skipped by another's replacement above it: priority fixes it
+        for w in self.precompiled_wraps():
+            if w["skipped"] and w["wrapper"][1] in info:
+                info[w["wrapper"][1]]["pre_wrap"].append((w["shown"], nm(*w["replacer"])))
+                if w["replacer"][1]:
+                    info[w["wrapper"][1]]["blob_of"][w["shown"]] = w["replacer"][1]
         return info
 
     def _changed_game_functions(self, rel, path, wanted):
@@ -10884,16 +15210,244 @@ class ModManager:
             return []
         return [k for k in wanted if k in ours and _norm(list(ours[k])) != _norm(list(theirs.get(k, ())))]
 
-    def annotation_clashes(self):
-        """{(annotation, 'Class.Name'): [(label, mod id or None)]} for every method or field that
-        two mods' scripts both add (@addMethod, @addField), or both replace (@replaceMethod),
-        from different files. The game compiles every script together: a class can't have two
-        members with one name, and a method can only be replaced once. A file two mods both ship
-        is loaded once (merged, or the top copy), so the same symbol there isn't a clash."""
+    def blob_source(self, mid):
+        """A mod's precompiled scripts as WitcherScript: (text, {(class, function) lower: line}, label),
+        or None when it has none or they can't be read. Remembered by the files' size and time."""
+        m = self.get(mid)
+        if not m:
+            return None
+        paths = []
+        for t in m["targets"]:
+            if t.lower().startswith("mods/"):
+                content = ci_child(self.stage_dir(m) / t, "content")
+                for dp, _dn, files in os.walk(content) if content else ():
+                    paths += sorted(Path(dp, f) for f in files if f.lower().endswith(".rsblob"))
+        if not paths:
+            return None
+        cache = self.__dict__.setdefault("_blob_src", {})
+        try:
+            sig = tuple((str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in paths)
+        except OSError:
+            return None
+        if sig in cache:
+            return cache[sig]
+        texts, where, n = [], {}, 0
+        for p in paths:
+            try:
+                blob = rsblob_parse(p.read_bytes())
+            except (OSError, ValueError):
+                continue
+            label = "/".join(p.parts[-3:])
+            text, w = rsblob_source(blob, ci_path(self.game, VANILLA_SCRIPTS), label)
+            for k, line in w.items():
+                where.setdefault(k, line + n)
+            texts.append(text)
+            n += text.count("\n") + 1
+        if not texts:
+            return None
+        out = ("\n".join(texts), where, m["name"])
+        cache[sig] = out
+        return out
+
+    def _folder_index(self, root):
+        """A mod folder's scripts, indexed: its loose scripts (script_index) and its precompiled
+        ones (rsblob_symbols) together, as one script_index-shaped dict plus 'blob_annotated'."""
+        out = {"types": {}, "states": {}, "state_base": {}, "members": set(), "globals": set(),
+               "annotated": [], "spelt": {}, "blob_annotated": [], "files": {}}
+        content = ci_child(root, "content") if root else None
+        scripts = ci_child(content, "scripts") if content else None
+        for dp, _dn, files in os.walk(content) if content and content.is_dir() else ():
+            for f in files:
+                low = f.lower()
+                path = Path(dp, f)
+                if low.endswith(".ws") and scripts is not None and scripts in path.parents:
+                    idx = script_index(path)
+                    merge_index(out, idx)
+                    rel = path.relative_to(scripts).as_posix()
+                    for a in idx.get("annotated", ()):
+                        out["files"].setdefault(a, rel)
+                elif low.endswith(".rsblob"):
+                    for key, shown in rsblob_symbols(path).items():
+                        kind = key[0]
+                        cls, nm = key[1], key[2]
+                        if "." in shown:
+                            c_sp, _, n_sp = shown.partition(".")
+                            out["spelt"].setdefault(cls, c_sp)
+                            out["spelt"].setdefault(nm, n_sp)
+                        if kind == "type":
+                            out["types"].setdefault(nm, "")
+                            out["spelt"].setdefault(nm, shown)
+                        elif kind == "extends":
+                            out["types"][cls] = nm
+                            out["spelt"].setdefault(nm, shown)
+                        elif kind == "state":
+                            full = nm if nm.startswith(f"{cls}state") else f"{cls}state{nm}"
+                            out["states"].setdefault(full, cls)
+                        elif kind == "classfn":
+                            out["members"].add(f"{cls}.{nm}")
+                        elif kind == "function":
+                            out["globals"].add(nm)
+                        elif kind in ("@addmethod",):
+                            out["members"].add(f"{cls}.{nm}")
+                            out["blob_annotated"].append(("addmethod", cls, nm))
+                        elif kind in ("@wrapmethod", "@replacemethod", "@addfield"):
+                            out["blob_annotated"].append((kind[1:], cls, nm))
+        return out
+
+    # the root of every class, never declared in a script
+    _ROOT_TYPES = {"iscriptable", "cobject"}
+
+    def compile_breaks(self):
+        """{mod id: [break]} for what in a mod's scripts the game can't compile against: an
+        annotation (@wrapMethod, @replaceMethod, @addMethod, @addField) on a class no script
+        declares, a @wrapMethod / @replaceMethod of a function its class doesn't have (nor any
+        class it extends), and a class built on a class nothing loaded declares. Usually a mod
+        made for another game version, or one that needs a mod that's missing or switched off.
+        A break: {'what': 'class' / 'function' / 'base', 'shown', 'ann' (as written, or ''),
+        'file' (a loose script, or ''), 'provider' (a mod that's switched off and has it, or None)}.
+        Worked out once per sync, from every loaded folder's scripts and the game's."""
+        cl = self.clashes()
+        hit = getattr(self, "_breaks", None)
+        if hit is not None and hit[0] is cl:
+            return hit[1]
+        game = game_script_index(ci_path(self.game, VANILLA_SCRIPTS))
+        folders = {low: self._folder_index(self._folder_path(low)) for low in cl["folders"]}
+        # scripts in dlc folders count as there too (never checked themselves: rarely any)
+        dlc_dir = ci_child(self.game, "dlc")
+        extra = [self._folder_index(d) for d in (kids(dlc_dir) if dlc_dir else []) if d.is_dir()]
+        types, states, members, globs = dict(game["types"]), dict(game["states"]), set(game["members"]), set(game["globals"])
+        state_base = dict(game["state_base"])
+        for idx in list(folders.values()) + extra:
+            for k, v in idx["types"].items():
+                if v or k not in types:
+                    types[k] = v
+            for k, v in idx["states"].items():
+                states.setdefault(k, v)
+            for k, v in idx["state_base"].items():
+                state_base.setdefault(k, v)
+            members |= idx["members"]
+            globs |= idx["globals"]
+        # classes the game's own scripts build on without declaring them (the engine's: IGameSystem,
+        # CR4HudModule…): they exist, whatever a mod's copy of a game script builds on them
+        engine = {b for b in game["types"].values() if b}
+        known = lambda c: c in types or c in states or c in engine or c in self._ROOT_TYPES
+        short = {}                                   # a state's own name -> its full names
+        for full, machine in states.items():
+            short.setdefault(full[len(machine) + 5:], []).append(full)
+
+        def state_parent(full):
+            """The full name of the state a state builds on: the one with that name in its own
+            machine, or in a class the machine builds on; any state of that name otherwise."""
+            base = state_base.get(full)
+            if not base:
+                return None
+            cls, seen = states.get(full), set()
+            while cls and cls not in seen:
+                seen.add(cls)
+                if f"{cls}state{base}" in states:
+                    return f"{cls}state{base}"
+                cls = types.get(cls)
+            return (short.get(base) or [base])[0]
+
+        def has_member(cls, fn):
+            """Does the class, or one it builds on, have this function? Also yes when the line of
+            classes reaches one no script declares (the engine's): what it has can't be known."""
+            seen = set()
+            while cls and cls not in seen:
+                seen.add(cls)
+                if f"{cls}.{fn}" in members:
+                    return True
+                if cls not in types and cls not in states and cls not in self._ROOT_TYPES:
+                    return True
+                cls = types.get(cls) if cls in types else state_parent(cls)
+            return False
+        # what switched-off mods would provide, to say which one a mod needs
+        off = {}
+        for m in self.mods:
+            if m["enabled"]:
+                continue
+            for t in m["targets"]:
+                if t.lower().startswith("mods/"):
+                    idx = self._folder_index(self.stage_dir(m) / t)
+                    for name in list(idx["types"]) + list(idx["states"]):
+                        off.setdefault(name, m["name"])
+        out = {}
+        for low, (fname, mid, _res) in cl["folders"].items():
+            if mid is None or low == AUTO_MERGE_NAME.lower():
+                continue
+            idx = folders[low]
+            sp = lambda n: idx["spelt"].get(n) or game["spelt"].get(n) or n
+            found = []
+            for ann, cls, fn in [(a, c, f) for a, c, f in idx["annotated"]] + [(a, c, f) for a, c, f in idx["blob_annotated"]]:
+                label = {"wrapmethod": "@wrapMethod", "replacemethod": "@replaceMethod", "addmethod": "@addMethod",
+                         "addfield": "@addField"}.get(ann, "@" + ann)
+                where = idx["files"].get((ann, cls, fn), "")
+                if not cls:
+                    if ann in ("wrapmethod", "replacemethod") and fn not in globs:
+                        found.append({"what": "function", "shown": sp(fn), "ann": label, "file": where, "provider": None})
+                    continue
+                if not known(cls):
+                    found.append({"what": "class", "shown": f"{sp(cls)}.{sp(fn)}", "ann": label, "file": where,
+                                  "provider": off.get(cls)})
+                elif ann in ("wrapmethod", "replacemethod") and not has_member(cls, fn):
+                    found.append({"what": "function", "shown": f"{sp(cls)}.{sp(fn)}", "ann": label, "file": where,
+                                  "provider": None})
+            for cls, base in list(idx["types"].items()) + [(f, state_parent(f)) for f in idx["state_base"]]:
+                if base and not known(base):
+                    found.append({"what": "base", "shown": f"{sp(cls)} extends {sp(base)}", "ann": "", "file": "",
+                                  "provider": off.get(base)})
+            if found:
+                out.setdefault(mid, []).extend(f for f in found if f not in out.get(mid, []))
+        self._breaks = (cl, out)
+        return out
+
+    def script_changes(self, mid):
+        """Every function and variable a mod's loose scripts change, add or wrap, as a set of
+        'class.name' in lower case (see script_changes_by_file)."""
+        return set().union(*self.script_changes_by_file(mid).values())
+
+    def script_changes_by_file(self, mid):
+        """{script (relative to content/scripts): the functions and variables it changes, adds or
+        wraps}: annotations (@addMethod, @replaceMethod, @wrapMethod, @addField), and the game
+        functions a copy of a game script changes or adds, as 'class.name' in lower case. Worked
+        out once per sync."""
+        cache = self.__dict__.setdefault("_script_changes", {})
+        key = (id(self.clashes()), mid)
+        if key in cache:
+            return cache[key]
+        by_file = {}
+        vanilla = ci_path(self.game, VANILLA_SCRIPTS)
+        for low, entry in self._script_inputs(everything=True).items():
+            for label, path, _vkey, smid in entry["sources"]:
+                if smid != mid:
+                    continue
+                out = by_file.setdefault(entry["rel"], set())
+                for k, shown in list(_annotated_symbols(path).items()) + list(_wrapped_methods(path).items()):
+                    out.add(shown.lower())
+                base_path = ci_path(vanilla, entry["rel"])
+                if base_path.is_file():
+                    try:
+                        ours = _bodies(decode_script(Path(path).read_bytes())[0])
+                        theirs = _bodies(decode_script(base_path.read_bytes())[0])
+                    except (OSError, UnicodeError, ValueError):
+                        continue
+                    out.update(f"{c}.{n}" if c else n for (c, n), body in ours.items()
+                               if _norm(list(body)) != _norm(list(theirs.get((c, n), ()))))
+        by_file = {rel: names for rel, names in by_file.items() if names}
+        if len(cache) > 500:
+            cache.clear()
+        cache[key] = by_file
+        return by_file
+
+    def _symbol_sources(self):
+        """{key: {source: [(label, mod id)]}}, {key: shown}: every method or field mods' scripts add,
+        replace or wrap, by where it comes from: a loose script's path (relative), 'rsblob:<folder>/
+        <file>' for precompiled scripts, 'edit:<path>' for a mod's copy of a game script that changes
+        (or has) a function a precompiled mod replaces or adds."""
         found, spelt = {}, {}                        # key -> {rel: [(label, mid)]}
         for low, entry in self._script_inputs(everything=True).items():
             for label, path, _vkey, mid in entry["sources"]:
-                for key, shown in _annotated_symbols(path).items():
+                for key, shown in list(_annotated_symbols(path).items()) + list(_wrapped_methods(path).items()):
                     found.setdefault(key, {}).setdefault(low, []).append((label, mid))
                     spelt.setdefault(key, shown)
         # precompiled scripts (precompiled.rsblob) are loaded alongside: what they add or
@@ -10901,7 +15455,7 @@ class ModManager:
         # Arms carries the same menu classes as Quest Tweaks and Events (which it took in), and
         # the game starts fine with both, in either order (tried in game)
         c = self.clashes()
-        targets = {}
+        targets, game = {}, None
         for low in sorted(c["blobs"]):
             label, mid = c["folders"][low][0], c["folders"][low][1]
             content = ci_child(self._folder_path(low), "content")
@@ -10909,27 +15463,144 @@ class ModManager:
                 for f in files:
                     if f.lower().endswith(".rsblob"):
                         for key, shown in rsblob_symbols(Path(dp, f)).items():
-                            if not key[0].startswith("@"):
+                            src = f"rsblob:{low}/{f.lower()}"
+                            if key[0] == "classfn":
+                                # one of the game's own classes declared again (Deaths Reworked's
+                                # W3DamageManagerProcessor): its functions take the game's place,
+                                # like a @replaceMethod of each
+                                if game is None:
+                                    game = _game_type_names(ci_path(self.game, VANILLA_SCRIPTS))
+                                if key[1] not in game:
+                                    continue
+                                key, src = ("@replacemethod",) + key[1:], src + "#class"
+                            elif not key[0].startswith("@"):
                                 continue
-                            found.setdefault(key, {}).setdefault(f"rsblob:{low}/{f.lower()}", []).append((label, mid))
+                            found.setdefault(key, {}).setdefault(src, []).append((label, mid))
                             spelt.setdefault(key, shown)
                             if key[0] in ("@replacemethod", "@addmethod"):
                                 targets[key[1:]] = key[0]
         # a game function a precompiled mod replaces (or a method it adds) that another mod's
-        # copy of that game script changes (or has): only one of them is used. A copy that
-        # leaves it as the game has it doesn't count
+        # copy of that game script changes (or has). A copy that leaves it as the game has it
+        # doesn't count
         if targets:
             for low, entry in self._script_inputs(everything=True).items():
                 for label, path, _vkey, mid in entry["sources"]:
                     for fn in self._changed_game_functions(entry["rel"], path, targets):
                         key = (targets[fn],) + fn
                         found.setdefault(key, {}).setdefault(f"edit:{low}", []).append((label, mid))
-        out = {}
+        return found, spelt
+
+    @staticmethod
+    def _owners(rels):
+        return list(dict.fromkeys(o for who in rels.values() for o in who))
+
+    def _split_symbols(self):
+        """(red, used): red is annotation_clashes; used is precompiled_wins. Worked out together
+        once per sync."""
+        hit = getattr(self, "_symbol_split", None)
+        if hit is not None and hit[0] is self.clashes():
+            return hit[1], hit[2]
+        found, spelt = self._symbol_sources()
+        red, used = {}, {}
+        self._red_blob_only = set()
+        rel_of = {low: e["rel"] for low, e in self._script_inputs(everything=True).items()}
+
+        def files_of(sources, wid):
+            """{mod id or name: [the loose scripts it has this in]}, for the tooltip."""
+            out = {}
+            for r, who in sources.items():
+                if r.startswith("rsblob:"):
+                    continue
+                low = r[5:] if r.startswith("edit:") else r
+                for label, mid in who:
+                    if (mid or label) not in wid:
+                        out.setdefault(mid or label, []).append(rel_of.get(low, low))
+            return out
         for key, rels in found.items():
-            if len(rels) > 1:
-                owners = list(dict.fromkeys(o for who in rels.values() for o in who))
+            kind = key[0]
+            if kind == "@wrapmethod":
+                continue                                 # several mods may wrap one function
+            blob = {r: who for r, who in rels.items() if r.startswith("rsblob:")}
+            loose = {r: who for r, who in rels.items() if not r.startswith("rsblob:")}
+            blob_owners = {mid or label for label, mid in self._owners(blob)}
+            if kind in ("@replacemethod", "@addmethod") and len(blob_owners) == 1 and loose:
+                # precompiled scripts win over loose ones for the same function, whatever the
+                # priority (CDPR's REDkit notes): the loose mods' changes to it aren't used
+                winner = self._owners(blob)
+                wid = {mid or label for label, mid in winner}
+                losers = []
+                for r, who in loose.items():
+                    how = "changes" if r.startswith("edit:") or kind == "@replacemethod" else "adds"
+                    losers += [(label, mid, how) for label, mid in who if (mid or label) not in wid]
+                wrap = found.get(("@wrapmethod",) + key[1:], {})
+                if kind == "@replacemethod":
+                    losers += [(label, mid, "wraps") for r, who in wrap.items() if not r.startswith("rsblob:")
+                               for label, mid in who if (mid or label) not in wid]
+                if losers:
+                    files = files_of(loose, wid)
+                    for k, v in files_of(wrap, wid).items():
+                        files.setdefault(k, []).extend(v)
+                    used[spelt[key]] = {"winner": winner, "losers": list(dict.fromkeys(losers)), "kind": kind,
+                                        "files": {k: sorted(set(v), key=str.lower) for k, v in files.items()}}
+                continue
+            counted = {r: who for r, who in rels.items() if not r.endswith("#class")}
+            if len(counted) > 1:
+                owners = self._owners(counted)
                 if len({mid or label for label, mid in owners}) > 1:
-                    out[(key[0], spelt[key])] = owners
+                    red[(kind, spelt[key])] = owners
+                    if all(r.startswith("rsblob:") for r in counted):
+                        self._red_blob_only.add((kind, spelt[key]))   # two precompiled mods: not tried in game
+        # a loose wrapper of a function only precompiled scripts replace (no loose change to it)
+        for key, rels in found.items():
+            if key[0] != "@replacemethod" or spelt[key] in used:
+                continue
+            blob = {r: who for r, who in rels.items() if r.startswith("rsblob:")}
+            if not blob or len({mid or label for label, mid in self._owners(blob)}) != 1:
+                continue
+            winner = self._owners(blob)
+            wid = {mid or label for label, mid in winner}
+            wrap = found.get(("@wrapmethod",) + key[1:], {})
+            losers = [(label, mid, "wraps") for r, who in wrap.items() if not r.startswith("rsblob:")
+                      for label, mid in who if (mid or label) not in wid]
+            if losers:
+                used[spelt[key]] = {"winner": winner, "losers": list(dict.fromkeys(losers)), "kind": key[0],
+                                    "files": {k: sorted(set(v), key=str.lower) for k, v in files_of(wrap, wid).items()}}
+        self._symbol_split = (self.clashes(), red, used)
+        return red, used
+
+    def annotation_clashes(self):
+        """{(annotation, 'Class.Name'): [(label, mod id or None)]} for every method or field that
+        two mods' scripts both add (@addMethod, @addField), or both replace (@replaceMethod),
+        from different files. The game compiles every script together: a class can't have two
+        members with one name, and a method can only be replaced once. A file two mods both ship
+        is loaded once (merged, or the top copy), so the same symbol there isn't a clash. One
+        precompiled mod against loose scripts isn't one either: see precompiled_wins."""
+        return self._split_symbols()[0]
+
+    def precompiled_wins(self):
+        """{'Class.Name': {'winner': [(label, mod id)], 'losers': [(label, mod id, how)], 'kind'}}
+        for a function one precompiled mod replaces or adds that loose scripts also change, add
+        ('changes', 'adds': a copy of the game script, or an annotation) or wrap ('wraps'). The
+        precompiled one is used whatever the priority; the others' versions of it aren't."""
+        return self._split_symbols()[1]
+
+    def precompiled_wraps(self):
+        """[{'shown', 'replacer': (label, mod id), 'wrapper': (label, mod id), 'skipped': bool}] for
+        a function a precompiled mod replaces and another precompiled mod wraps. The wrapper is
+        skipped while the replacement has the higher priority (Script Merger - Remastered's
+        findings); above it, it wraps the replacement and both work."""
+        c = self.clashes()
+        rank = {n.lower(): i for i, (n, _e, _m) in enumerate(self.settings_rows())}
+        def place(low):
+            return (0, rank[low], "") if low in rank else (1, 0, low)
+        out = []
+        for w in c.get("wraps", ()):
+            for r in w["replacers"]:
+                for wr in w["wrappers"]:
+                    if wr == r:
+                        continue
+                    out.append({"shown": w["shown"], "replacer": c["folders"][r][:2], "wrapper": c["folders"][wr][:2],
+                                "skipped": place(r) < place(wr)})
         return out
 
 
@@ -10960,6 +15631,7 @@ C = {
     "sky": "#8ec5f0",      # a newer version (on Nexus, or downloaded): news, not a problem
     "steel": "#86b0cf",    # folder names in tooltips
     "tip_rule": "#535d69", # thin line between groups in a tooltip
+    "section": "#2b323a",  # a section's row in the mod list (the raised shade, as buttons)
 }
 
 
@@ -10978,6 +15650,9 @@ _over = lambda colour, alpha, under: (lambda a, b: QColor(*(round(alpha * x + (1
     (a.red(), a.green(), a.blue()), (b.red(), b.green(), b.blue())))).name())(QColor(colour), QColor(under))
 C["menu_sign"] = _over(C["ash"], 0.7, C["slate"])        # a mod's game menu, in the list: there, but quiet
 C["menu_sign_off"] = _over(C["ash"], 0.4, C["slate"])    # the same for a mod switched off
+C["menu_strike"] = _over(C["blood"], 0.8, C["slate"])    # its menu hidden from the game's: the stroke through it, dark red
+C["menu_strike_off"] = _over(C["blood"], 0.5, C["slate"])   # the same for a mod switched off
+C["winner"] = C["steel"]                        # in a tooltip, the mod whose copy is used: blue, bold
 C["kind_light"] = _over_tip(C["steel"], 0.75)   # a kind of file's line over them: what it is, in blue,
 C["kind_deep"] = (lambda q: QColor.fromHsv(q.hsvHue(), min(255, int(q.hsvSaturation() * 1.6)), q.value()).name())(
     QColor(C["kind_light"]))                    # and how many, the same blue, deeper
@@ -11037,12 +15712,15 @@ QPushButton#ListToggle:checked {{ background: {C['raised']}; }}
 QPushButton#ListToggle:checked:hover {{ background: #313943; }}
 QFrame#ScrollTip {{ background: transparent; border: 0; }}
 QFrame#TipBody {{ background: {C['tip']}; border: 1px solid {C['tip_edge']}; border-radius: 6px; }}
-QFrame#TipBody QScrollBar:vertical {{ background: rgba(255,255,255,0.05); width: 8px; margin: 6px 4px 6px 0;
-    border-radius: 4px; }}
-QFrame#TipBody QScrollBar::handle:vertical {{ background: #7a848f; border-radius: 4px; min-height: 30px; }}
+QFrame#TipBody QScrollBar:vertical {{ background: transparent; width: 11px; margin: 6px 3px 6px 0; }}
+QFrame#TipBody QScrollBar::handle:vertical {{ background: #7a848f; border-radius: 4px; min-height: 30px; margin: 0; }}
+QFrame#TipBody QScrollBar::add-page:vertical, QFrame#TipBody QScrollBar::sub-page:vertical {{
+    background: rgba(255,255,255,0.06); border-radius: 4px; }}
 QFrame#TipBody QScrollBar::handle:vertical:hover {{ background: #9aa3ad; }}
 QFrame#TipBody QScrollBar:vertical[idle="true"] {{ background: transparent; }}
 QFrame#TipBody QScrollBar::handle:vertical[idle="true"] {{ background: transparent; }}
+QFrame#TipBody QScrollBar[idle="true"]::add-page:vertical, QFrame#TipBody QScrollBar[idle="true"]::sub-page:vertical {{
+    background: transparent; }}
 QFrame#ScrollTip QScrollArea, QFrame#ScrollTip QLabel#TipText {{ background: transparent; color: {C['silver']}; }}
 QLabel#TipMore {{ color: {C['ash']}; padding: 10px 0 4px 0; border-bottom-left-radius: 6px; border-bottom-right-radius: 6px;
                   background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(47,55,64,0), stop:0.55 {C['tip']}); }}
@@ -11052,6 +15730,42 @@ QLabel#Subtitle, QLabel#Muted {{ color: {C['ash']}; }}
 QLabel#Empty {{ color: {C['ash']}; font-size: 12pt; }}
 QLabel#Warn {{ color: {C['bronze_hi']}; font-weight: 600; }}
 QLabel#DialogTitle {{ font-size: 14pt; font-weight: 600; }}
+QLabel#MenuSeparator {{ color: {C['bronze_muted']}; font-weight: 600; letter-spacing: 1px; font-size: 9pt; }}
+QFrame#MenuCard {{ background: {C['slate']}; border: 1px solid {C['ridge']}; border-radius: 10px; }}
+QFrame#MenuRow {{ background: transparent; border: 0; border-radius: 8px; }}
+QFrame#MenuRow:hover {{ background: rgba(255,255,255,0.045); }}
+QFrame#MenuRow QLabel#MenuLabel {{ background: transparent; color: {C['silver']}; }}
+QLabel#MenuValue {{ color: {C['silver']}; font-weight: 600; background: {C['well']}; border: 1px solid {C['ridge']};
+    border-radius: 6px; padding: 3px 0; }}
+QLabel#MenuValue[moved="true"] {{ color: {C['bronze_hi']}; border-color: rgba(201,164,92,0.55); }}
+QComboBox#MenuCombo {{ background: {C['well']}; border: 1px solid {C['ridge_hi']}; color: {C['silver']};
+    padding: 2px 10px; border-radius: 6px; }}
+QComboBox#MenuCombo:hover {{ border-color: {C['bronze_muted']}; }}
+QComboBox#MenuCombo:focus, QComboBox#MenuCombo:on {{ border-color: {C['bronze']}; }}
+QComboBox#MenuCombo QAbstractItemView {{ background: {C['tip']}; border: 1px solid {C['tip_edge']}; border-radius: 0;
+    padding: 4px; outline: 0; color: {C['silver']}; }}
+QComboBox#MenuCombo QAbstractItemView::item {{ padding: 6px 10px; border-radius: 5px; min-height: 18px; }}
+QComboBox#MenuCombo QAbstractItemView::item:hover {{ background: rgba(201,164,92,0.20); color: {C['silver']}; }}
+QComboBox#MenuCombo QAbstractItemView::item:selected {{ background: rgba(201,164,92,0.30); color: {C['bronze_hi']}; }}
+QComboBox#MenuCombo QAbstractItemView QScrollBar:vertical {{ background: transparent; width: 11px; margin: 6px 3px 6px 0; }}
+QComboBox#MenuCombo QAbstractItemView QScrollBar::handle:vertical {{ background: #7a848f; border-radius: 4px; min-height: 30px; margin: 0; }}
+QComboBox#MenuCombo QAbstractItemView QScrollBar::handle:vertical:hover {{ background: #9aa3ad; }}
+QComboBox#MenuCombo QAbstractItemView QScrollBar::add-page:vertical, QComboBox#MenuCombo QAbstractItemView QScrollBar::sub-page:vertical {{ background: transparent; }}
+QSlider#MenuSlider {{ background: transparent; min-height: 22px; }}
+QSlider#MenuSlider::groove:horizontal {{ height: 4px; background: {C['ridge']}; border-radius: 2px; }}
+QSlider#MenuSlider::sub-page:horizontal {{ background: {C['bronze']}; border-radius: 2px; }}
+QSlider#MenuSlider::handle:horizontal {{ background: {C['silver']}; width: 14px; height: 14px; margin: -5px 0; border-radius: 7px; }}
+QSlider#MenuSlider::handle:horizontal:hover {{ background: #ffffff; }}
+QFrame#MenuInfo {{ background: {C['well']}; border: 1px solid {C['ridge']}; border-radius: 10px; }}
+QFrame#MenuInfo[empty="true"] {{ background: transparent; border-color: transparent; }}
+QLabel#MenuInfoMark {{ color: {C['stone']}; background: {C['bronze_muted']}; border-radius: 9px; font-weight: 700; font-size: 9pt; }}
+QLabel#MenuInfoText {{ color: {C['ash']}; background: transparent; }}
+QListWidget#MenuPages {{ background: transparent; border: 0; }}
+QListWidget#MenuPages::item {{ padding: 9px 26px 9px 12px; border-radius: 7px; color: {C['ash']}; border-left: 3px solid transparent; }}
+QListWidget#MenuPages::item:hover {{ background: rgba(255,255,255,0.04); color: {C['silver']}; }}
+QListWidget#MenuPages::item:selected {{ background: rgba(201,164,92,0.13); color: {C['silver']}; border-left: 3px solid {C['bronze']}; }}
+QPushButton#PresetBtn {{ padding: 5px 14px; border-radius: 13px; }}
+QPushButton#PresetBtn[active="true"] {{ background: rgba(201,164,92,0.16); border: 1px solid {C['bronze']}; color: {C['bronze_hi']}; }}
 
 QLineEdit, QComboBox {{ background: {C['slate']}; border: 1px solid {C['ridge']}; border-radius: 7px;
     padding: 6px 10px; selection-background-color: {C['bronze']}; selection-color: {C['stone']}; }}
@@ -11060,6 +15774,7 @@ QLineEdit:focus, QComboBox:focus {{ border-color: {C['bronze']}; }}
 QLineEdit:disabled {{ color: {C['dim']}; }}
 QComboBox::drop-down {{ border: 0; width: 26px; }}
 QComboBox::down-arrow {{ image: url({u['chevron']}); width: 12px; height: 12px; }}
+QuietWheelCombo {{ combobox-popup: 0; }}
 QComboBox QAbstractItemView {{ background: {C['raised']}; border: 1px solid {C['ridge']};
     padding: 4px; selection-background-color: rgba(201,164,92,0.22); selection-color: {C['silver']}; }}
 
@@ -11071,6 +15786,9 @@ QPushButton:disabled, QToolButton:disabled {{ color: {C['dim']}; }}
 QLabel#SectionHead {{ color: {C['ash']}; font-weight: 600; font-size: 9pt; }}
 QPushButton#Link {{ background: transparent; border: 0; padding: 0; color: {C['bronze_hi']}; text-align: left; }}
 QPushButton#Link:hover {{ color: {C['bronze']}; text-decoration: underline; }}
+QPushButton#QuietLink {{ background: transparent; border: 0; padding: 0; color: {C['ash']}; text-align: left; }}
+QPushButton#QuietLink:hover {{ color: {C['silver']}; text-decoration: underline; }}
+QPushButton#QuietLink:disabled {{ color: {C['dim']}; }}
 QPushButton#Primary {{ background: {C['bronze']}; color: {C['stone']}; border: 0; font-weight: 600; padding: 8px 18px; }}
 QPushButton#Primary:hover {{ background: {C['bronze_hi']}; }}
 QPushButton#Primary:disabled {{ background: {C['ridge']}; color: {C['dim']}; }}
@@ -11111,9 +15829,11 @@ QFrame#InstCard QTreeView, QFrame#InstCard QTableView {{ border: 0; border-radiu
 QFrame#InstCard QLabel#Tag {{ color: {C['bronze_hi']}; background: rgba(201,164,92,0.14); border: 1px solid rgba(201,164,92,0.4);
     border-radius: 5px; padding: 0 6px; font-size: 9pt; }}
 
-QScrollBar:vertical {{ background: transparent; width: 10px; margin: 6px 2px; }}
-QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 2px 6px; }}
+QScrollBar:vertical {{ background: transparent; width: 10px; margin: 6px 0; }}
+QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 0 6px; }}
 QScrollBar::handle {{ background: {C['ridge']}; border-radius: 3px; min-height: 30px; min-width: 30px; }}
+QScrollBar::handle:vertical {{ margin: 0 2px; }}
+QScrollBar::handle:horizontal {{ margin: 2px 0; }}
 QScrollBar::handle:hover {{ background: {C['ridge_hi']}; }}
 QScrollBar[idle="true"]::handle {{ background: transparent; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
@@ -11142,8 +15862,10 @@ QLabel#DlTick {{ color: {C['moss']}; font-weight: 600; }}
 QLabel#DlTick[kind="update"] {{ color: {C['sky']}; }}
 QFrame#DlRow {{ background: transparent; border: 0; }}
 QFrame#DlRow[nested="true"] {{ background: {C['slate']}; border: 1px solid {C['ridge']}; border-radius: 6px; }}
-QFrame#DlGroup[flash="true"] {{ border: 1px solid {C['bronze']}; }}
-QFrame#DlRow[nested="true"][flash="true"] {{ border: 1px solid {C['bronze']}; }}
+QFrame#DlGroup[linked="true"] {{ border: 1px solid {C['bronze']}; }}
+QFrame#DlRow[nested="true"][linked="true"] {{ border: 1px solid {C['bronze']}; }}
+QFrame#DlGroup[flash="true"] {{ border: 1px solid {C['bronze_hi']}; }}
+QFrame#DlRow[nested="true"][flash="true"] {{ border: 1px solid {C['bronze_hi']}; }}
 QLabel#DlTitle {{ color: {C['silver']}; }}
 QLabel#Muted[dlstate="done"] {{ color: {C['moss']}; }}
 QLabel#Muted[dlstate="failed"] {{ color: {C['blood']}; }}
@@ -11729,11 +16451,12 @@ def theme_icon(*names):
 
 
 PRIORITY_COL, NAME_COL, VERSION_COL, CONFLICT_COL, DATE_COL = range(5)
+CHIP_COUNT = re.compile(r"^(\S+) (?:\d+|!|\?|…|off)$")   # "⚠ 9", "≡ !": the count or mark after a chip's icon
 COLUMNS = 5
 CHIPS_ROLE = Qt.ItemDataRole.UserRole + 1
 SEP_ROLE = Qt.ItemDataRole.UserRole + 3
 COLLAPSED_ROLE = Qt.ItemDataRole.UserRole + 4
-GRID_ALPHA = 0.55                                # how strongly the mod list's grid lines show
+GRID_ALPHA = 0.42                                # how strongly the mod list's grid lines show
 COUNT_ROLE = Qt.ItemDataRole.UserRole + 5      # a section's (mods switched on, mods in it)
 
 
@@ -11743,10 +16466,15 @@ def section_count(on, n):
 OFF_ROLE = Qt.ItemDataRole.UserRole + 2
 GROUP_ROLE = Qt.ItemDataRole.UserRole + 6
 MENU_ROLE = Qt.ItemDataRole.UserRole + 7       # a mod's own game menus: the tooltip of its sign in the list
+MENU_HIDDEN_ROLE = Qt.ItemDataRole.UserRole + 40   # its menu hidden from the game's own menu: the sign struck through
+MARK_ROLE = Qt.ItemDataRole.UserRole + 42      # was on when all mods were turned off, still off: its box outlined
 GHEAD_ROLE = Qt.ItemDataRole.UserRole + 8      # a group's header row (a group without a main mod): its id
 GHEAD_PREFIX = "group:"                        # a header row's id in the list (never a mod's)
-HEAD_LOOK = "bronze"                           # a group header: "plain" (like a mod row), "bronze" (its name in
-                                               # the group lines' colour) or "tint" (a faint bronze shade)
+FRESH_ROLE = Qt.ItemDataRole.UserRole + 9      # a section row holding a mod just installed: its bronze edge
+FRESH_FOR = 30 * 60                            # s: how long a just-installed mod marks its section
+HEAD_LOOK = "bold"                             # a group header: "plain" (like a mod row), "bold" (the same, its
+                                               # name in bold), "bronze" (its name in the group lines' colour) or
+                                               # "tint" (a faint bronze shade)
 
 
 class RowDelegate(QStyledItemDelegate):
@@ -11874,7 +16602,7 @@ class RowDelegate(QStyledItemDelegate):
     def _head_arrow(self, p, opt, idx):
         folded = bool(idx.siblingAtColumn(0).data(COLLAPSED_ROLE))
         r = self.head_arrow_rect(opt, idx)
-        col = QColor(C["bronze"] if HEAD_LOOK == "bronze" else C["ash"])
+        col = QColor(C["bronze"] if HEAD_LOOK in ("bronze", "bold") else C["ash"])
         pen = QPen(col, 1.6)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
@@ -11904,10 +16632,14 @@ class RowDelegate(QStyledItemDelegate):
             room = o.rect.right() - self.MENU_SPACE - tr.left()
             o.text = o.fontMetrics.elidedText(o.text, Qt.TextElideMode.ElideRight, max(0, room))
 
+    SIGN_GAP = 1.2                                      # the strike's clear band, half its width (px)
+
     @staticmethod
-    def _menu_sign(p, r, colour):
+    def _menu_sign(p, r, colour, hidden=False, strike=None):
         """Two sliders: the usual sign for settings. Each line is broken where its ring sits,
-        so it reads the same over any row colour (hovered, selected)."""
+        so it reads the same over any row colour (hovered, selected). hidden: its menu is left out
+        of the game's own menu: the sign struck through, the sliders left open around the stroke
+        so it reads over any row colour too. strike: the stroke's own colour (dark red), kept on hover."""
         p.save()
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         pen = QPen(QColor(colour), 1.3)
@@ -11915,11 +16647,29 @@ class RowDelegate(QStyledItemDelegate):
         p.setPen(pen)
         p.setBrush(Qt.BrushStyle.NoBrush)
         cx, cy, k = r.center().x(), r.center().y(), 2.2
+        if hidden:
+            # the stroke from top left to bottom right; the sliders kept a hair clear of it
+            a, b = QPointF(cx - 6.5, cy - 6.5), QPointF(cx + 6.5, cy + 6.5)
+            h = RowDelegate.SIGN_GAP / 1.4142           # half the band across the stroke, as x/y offsets
+            clear = QPainterPath(QPointF(cx - 9 - h, cy - 9 + h))
+            for x, y in ((-9 + h, -9 - h), (9 + h, 9 - h), (9 - h, 9 + h)):
+                clear.lineTo(cx + x, cy + y)
+            clear.closeSubpath()
+            whole = QPainterPath()
+            whole.addRect(QRectF(cx - 12, cy - 12, 24, 24))
+            p.save()
+            p.setClipPath(whole.subtracted(clear), Qt.ClipOperation.IntersectClip)
         for dy, kx in ((-3.5, 2.5), (3.5, -2.5)):
             y = cy + dy
             p.drawLine(QPointF(cx - 6, y), QPointF(cx + kx - k - 0.6, y))
             p.drawLine(QPointF(cx + kx + k + 0.6, y), QPointF(cx + 6, y))
             p.drawEllipse(QPointF(cx + kx, y), k, k)
+        if hidden:
+            p.restore()                                 # back to the row's own clip for the stroke
+            if strike:
+                pen.setColor(QColor(strike))
+                p.setPen(pen)
+            p.drawLine(a, b)
         p.restore()
 
     def sizeHint(self, opt, idx):
@@ -11950,9 +16700,13 @@ class RowDelegate(QStyledItemDelegate):
             p.save()
             p.setRenderHint(QPainter.RenderHint.Antialiasing)
             r = opt.rect
-            p.fillRect(r, QColor(C["raised"]))
+            # a section: its band, and a bronze edge on the left while it holds a mod just
+            # installed (until you select that mod again, or FRESH_FOR runs out)
+            p.fillRect(r, QColor(C["section"]))
             p.setPen(QColor(C["ridge"]))
             p.drawLine(r.left(), r.bottom(), r.right(), r.bottom())
+            if idx.siblingAtColumn(0).data(FRESH_ROLE):     # a mod was just installed in it
+                p.fillRect(QRectF(r.left(), r.top(), 3, r.height()), QColor(C["bronze"]))
             collapsed = bool(idx.siblingAtColumn(0).data(COLLAPSED_ROLE))
             font = QFont(opt.font)
             font.setBold(True)
@@ -11988,9 +16742,16 @@ class RowDelegate(QStyledItemDelegate):
                 style = opt.widget.style() if opt.widget else QApplication.style()
                 style.drawPrimitive(QStyle.PrimitiveElement.PE_PanelItemViewItem, bg, p, opt.widget)
             super().paint(p, o, idx)
+            if col == NAME_COL and idx.data(MARK_ROLE):
+                self._mark(p, o, idx)
             if col == NAME_COL and idx.data(MENU_ROLE):
                 off = bool(idx.siblingAtColumn(PRIORITY_COL).data(OFF_ROLE))
-                self._menu_sign(p, self.menu_rect(opt.rect), C["menu_sign_off"] if off else C["menu_sign"])
+                hover = (getattr(opt.widget, "menu_hover", None) is not None
+                         and idx.siblingAtColumn(0).data(Qt.ItemDataRole.UserRole) == opt.widget.menu_hover)
+                self._menu_sign(p, self.menu_rect(opt.rect),
+                                C["bronze_hi"] if hover else C["menu_sign_off"] if off else C["menu_sign"],
+                                hidden=bool(idx.data(MENU_HIDDEN_ROLE)),
+                                strike=C["menu_strike_off"] if off and not hover else C["menu_strike"])
             self._grid(p, opt)
             if g:
                 self._links(p, opt, idx, g)
@@ -12044,6 +16805,21 @@ class RowDelegate(QStyledItemDelegate):
                 p.drawText(r, Qt.AlignmentFlag.AlignCenter, text)
         p.restore()
         self._grid(p, opt)
+
+    def _mark(self, p, opt, idx):
+        """A mod "Turn all mods off" switched off, still off: its checkbox outlined in bronze."""
+        o = QStyleOptionViewItem(opt)
+        self.initStyleOption(o, idx)
+        style = o.widget.style() if o.widget else QApplication.style()
+        box = QRectF(style.subElementRect(QStyle.SubElement.SE_ItemViewItemCheckIndicator, o, o.widget))
+        side = min(box.width(), box.height(), 18)
+        r = QRectF(box.center().x() - side / 2, box.center().y() - side / 2, side, side).adjusted(0.5, 0.5, -0.5, -0.5)
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(QColor(C["bronze"]), 1.6))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(r, 4, 4)
+        p.restore()
 
     @staticmethod
     def _grid(p, opt):
@@ -12103,14 +16879,16 @@ def prio_start(text):
     return int(m.group()) if m else 0
 
 
-def menu_tip(names, enabled=True, left_out=False):
+def menu_tip(names, enabled=True, left_out=False, hidden=False):
     """The tooltip of a mod's menu sign in the list: the menu files it adds to the game (left_out:
-    you switched its menu off)."""
+    you switched its menu off; hidden: its page left out of the game's menu, its settings kept)."""
     note = ("Left out: you switched its menu off. Right-click → Edit… to add it." if left_out
-            else "" if enabled else "Switched off, so not in the game now.")
+            else "Switched off, so not in the game now." if not enabled
+            else "Hidden from the game's menu: its settings still work." if hidden else "")
     return (f"<b>Adds {'a menu' if len(names) == 1 else 'menus'} to the game</b>" + TIP_RULE
             + "<br>".join(file_html(n) for n in names)
-            + (f"{TIP_RULE}<span style='color:{C['ash']}'>{note}</span>" if note else ""))
+            + (f"{TIP_RULE}<span style='color:{C['ash']}'>{note}</span>" if note else "")
+            + f"{TIP_RULE}<span style='color:{C['ash']}'>Click to change its settings here.</span>")
 
 
 def precompiled_tip(blob):
@@ -12119,16 +16897,33 @@ def precompiled_tip(blob):
     if not blob:
         return ""
     return (f"<p style='margin:10px 0 0 0; color:{C['ash']}'>Its precompiled scripts win over loose "
-            "ones for the same function.</p>")
+            "ones for the same function, whatever the priority.</p>")
 
 
-def priority_tip(mod, rows, has_prefix, shared=(), legacy_on=False, blob=None):
+def links_tip(links):
+    """The note in a priority tooltip on the mods a mod's scripts build on, or that build on it:
+    the one built on always loads after (see ModManager._keep_deps_below)."""
+    by, needs = links or ((), ())
+    and_ = lambda names: names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+    lines = []
+    if by:
+        lines.append(f"Kept below {and_(by)}, which {'needs' if len(by) == 1 else 'need'} it. It has to "
+                     "load later, or the game's scripts won't compile.")
+    if needs:
+        lines.append(f"Kept above {and_(needs)}, which it needs. "
+                     f"{'That one has' if len(needs) == 1 else 'Those have'} to load later, or the game's scripts won't compile.")
+    if not lines:
+        return ""
+    return "".join(f"<p style='margin:10px 0 0 0; color:{C['ash']}'>{html.escape(l)}</p>" for l in lines)
+
+
+def priority_tip(mod, rows, has_prefix, shared=(), legacy_on=False, blob=None, links=None):
     """rows: [(number, folder)] as mods.settings has them — the list shows the same numbers.
     shared: [(folder, the mod whose number it goes by, that number)] for a mod sharing its
     folder with one that has a higher priority."""
     if not mod["enabled"]:
         return f"<span style='color:{C['ash']}'>Disabled, not in the game.</span>"
-    return _priority_tip(mod, rows, has_prefix, shared, legacy_on, blob) + precompiled_tip(blob)
+    return _priority_tip(mod, rows, has_prefix, shared, legacy_on, blob) + precompiled_tip(blob) + links_tip(links)
 
 
 def _priority_tip(mod, rows, has_prefix, shared, legacy_on, blob=None):
@@ -12155,61 +16950,89 @@ def _priority_tip(mod, rows, has_prefix, shared, legacy_on, blob=None):
 
 
 def file_block(name, mods, winner=False, note=""):
-    """A file name in blue, a little air, then the mods involved in load order. With
-    winner=True the top one — the copy the game uses — is bold and the rest are grey."""
+    """A file name in white, a little air, then the mods involved in load order. With
+    winner=True the top one — the copy the game uses — is blue and bold, the rest grey."""
     lines = []
     for i, mod in enumerate(mods):
         mod = html.escape(mod)
         if winner:
-            lines.append(f"<b>{mod}</b>" if i == 0 else f"<span style='color:{C['ash']}'>{mod}</span>")
+            lines.append(f"<b style='color:{C['winner']}'>{mod}</b>" if i == 0 else f"<span style='color:{C['ash']}'>{mod}</span>")
         else:
             lines.append(mod)
     if note:
         lines.append(f"<span style='color:{C['ash']}'>{html.escape(note).replace(chr(10), '<br>')}</span>")
-    return (f"<p style='margin:12px 0 0 0; color:{C['steel']}'>{html.escape(name)}</p>"
+    return (f"<p style='margin:12px 0 0 0; color:{C['silver']}'><b>{html.escape(name)}</b></p>"
             f"<p style='margin:4px 0 0 0'>{'<br>'.join(lines)}</p>")
 
 
 _PILLS = {}
 
 
-def prio_badge(label):
-    """A mod's priority number as a small rounded pill, like the list's, in front of its name in
-    a tooltip. Drawn once per number into the app's scratch folder (tooltips show images, not
-    rounded boxes)."""
-    if label in _PILLS:
-        return _PILLS[label]
-    font = QApplication.font()
-    fm = QFontMetricsF(font)
-    h = round(fm.height()) + 2
-    w = max(h + 6, round(fm.horizontalAdvance(label)) + 14)
-    scale = 2                                      # drawn at twice the size: sharp on HiDPI screens
-    img = QImage(w * scale, h * scale, QImage.Format.Format_ARGB32_Premultiplied)
+def tip_scale():
+    """The screen's scaling (1, 1.5, 2…): tooltip images are drawn at exactly that, so they're shown
+    pixel for pixel. Drawn bigger and shrunk to fit, at 150% they looked pixelated."""
+    screen = QGuiApplication.primaryScreen()
+    return max(1.0, round(screen.devicePixelRatio(), 2)) if screen else 1.0
+
+
+def save_tip_image(draw, w, h, name):
+    """An image for a tooltip's rich text, w x h logical pixels, drawn by draw(painter) at the
+    screen's scaling into the app's scratch folder. Returns its file (named for that scaling, so a
+    change of scaling draws it again)."""
+    scale = tip_scale()
+    UI_DIR.mkdir(parents=True, exist_ok=True)
+    path = UI_DIR / f"{name}_x{str(scale).replace('.', '_')}.png"
+    img = QImage(round(w * scale), round(h * scale), QImage.Format.Format_ARGB32_Premultiplied)
     img.fill(Qt.GlobalColor.transparent)
     p = QPainter(img)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    p.scale(scale, scale)
-    p.setPen(Qt.PenStyle.NoPen)
-    p.setBrush(QColor(C["ridge_hi"]))
-    p.drawRoundedRect(QRectF(0, 0, w, h), h / 2, h / 2)
-    p.setFont(font)
-    p.setPen(QColor(C["silver"]))
-    p.drawText(QRectF(0, 0, w, h), Qt.AlignmentFlag.AlignCenter, label)
+    p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+    p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+    p.scale(img.width() / w, img.height() / h)
+    draw(p)
     p.end()
-    UI_DIR.mkdir(parents=True, exist_ok=True)
-    path = UI_DIR / ("prio_" + re.sub(r"[^0-9]+", "_", label) + ".png")
     img.save(str(path))
-    _PILLS[label] = f"<img src='{path.as_posix()}' width='{w}' height='{h}' style='vertical-align: middle'>"
-    return _PILLS[label]
+    return path
+
+
+def prio_pill(label):
+    """The priority number of the mod whose copy is used, in a tooltip: on a small, faint rounded
+    background, in the text's own font and size. Drawn once per number (tooltips show images, not
+    boxes); the other mods' numbers are plain text."""
+    key = (label, tip_scale())
+    if key in _PILLS:
+        return _PILLS[key]
+    font = QFont(QApplication.font())
+    fm = QFontMetricsF(font)
+    h = round(fm.height())
+    w = max(h + 2, round(fm.horizontalAdvance(label)) + 10)
+
+    def draw(p):
+        p.setPen(Qt.PenStyle.NoPen)
+        bg = QColor(C["ridge_hi"])
+        bg.setAlphaF(0.55)
+        p.setBrush(bg)
+        p.drawRoundedRect(QRectF(0, 0, w, h), h / 2, h / 2)
+        p.setFont(font)
+        p.setPen(QColor(C["silver"]))
+        p.drawText(QRectF(0, 0, w, h), Qt.AlignmentFlag.AlignCenter, label)
+    path = save_tip_image(draw, w, h, "pill_" + re.sub(r"[^0-9]+", "_", label))
+    _PILLS[key] = f"<img src='{path.as_posix()}' width='{w}' height='{h}' style='vertical-align: middle'>"
+    return _PILLS[key]
 
 
 def mod_lines(names, prio=None):
     """Mods one per line (names already formatted), each with its priority in front when it has
-    one: a small table, so the names line up whatever the numbers' widths."""
+    one: a small table, so the names line up whatever the numbers' widths. The number of the mod
+    whose copy is used (blue) sits on a small pill; the others' are plain white."""
     labels = [(prio or {}).get(key) for key, _shown in names]
     if not any(labels):
         return "<br>".join(shown for _key, shown in names)
-    rows = "".join(f"<tr><td align='center' valign='middle' style='padding:1px 8px 1px 0'>{prio_badge(l) if l else ''}</td>"
+    def num(l, shown):
+        if not l:
+            return ""
+        return prio_pill(l) if C["winner"] in shown else f"<span style='color:{C['silver']}'>{html.escape(l)}</span>"
+    rows = "".join(f"<tr><td align='center' valign='middle' style='padding:1px 7px 1px 0'>{num(l, shown)}</td>"
                    f"<td valign='middle' style='padding:1px 0'>{shown}</td></tr>" for l, (_key, shown) in zip(labels, names))
     return f"<table cellspacing='0' cellpadding='0'>{rows}</table>"
 
@@ -12239,7 +17062,7 @@ KIND_INFO = {
     ".flyr": "Trees", ".srt": "Trees (SpeedTree)", ".grassmask": "Grass", ".w2sf": "Foliage",
     ".navmesh": "NPC paths", ".w2em": "Map pins", ".w2fnt": "Fonts", ".redswf": "Menus and HUD",
     ".w3app": "Appearances", ".reddlc": "DLC definitions", ".redgame": "Game definitions",
-    ".ini": "Settings files",
+    ".ini": "Settings files", ".bnk": "Sound banks", ".wem": "Sounds",
 }
 
 
@@ -12255,6 +17078,37 @@ _BUFFER = re.compile(r"^(.*\.w2mesh)(\.\d+\.buffer)$", re.I)
 
 
 _FOLDS = {}                   # key -> (folded, open) html of a kind's files, for ScrollTip to swap
+_VIEWS = {}                   # short id -> merge key, for a merged file's link in a tooltip
+
+
+def _blob_link(mid, shown):
+    """A function's name in a tooltip as a link to the precompiled mod's own version of it
+    (BlobScriptDialog). Under the mouse it's underlined (ScrollTip swaps in that copy)."""
+    cls, _, fn = shown.rpartition(".")
+    payload = ("blob", mid, cls, fn)
+    vid = hashlib.sha1(repr(payload).encode("utf-8", "replace")).hexdigest()[:16]
+    if len(_VIEWS) > 4000:
+        _VIEWS.clear()
+    link = lambda inner: f"<a href='view:{vid}' style='text-decoration:none'>{inner}</a>"
+    normal = f"<span style='color:{C['silver']}'>{html.escape(shown)}</span>"
+    hot = f"<span style='color:{C['silver']}; text-decoration:underline'>{html.escape(shown)}</span>"
+    _VIEWS[vid] = (payload, link(normal), link(hot))
+    return f"<!--v:{vid}-->{link(normal)}<!--/v:{vid}-->"
+
+
+def _view_link(key, name):
+    """A merged file's name in a tooltip as a link to see it whole (MergedScriptDialog). Under the
+    mouse it lights up (ScrollTip swaps in the brighter copy kept here)."""
+    vid = hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:16]
+    if len(_VIEWS) > 4000:
+        _VIEWS.clear()
+    link = lambda inner: f"<a href='view:{vid}' style='text-decoration:none'>{inner}</a>"
+    m = _FILE_EXT.search(name) or _LABEL_EXT.search(name)
+    stem, ext = (name[:m.start()], m.group(1)) if m and m.start() > 0 else (name, "")
+    hot = f"<span style='color:{C['silver']}'>{html.escape(stem)}</span>" + \
+          (f"<span style='color:{C['ash']}'>{html.escape(ext)}</span>" if ext else "")
+    _VIEWS[vid] = (key, link(file_html(name)), link(hot))
+    return f"<!--v:{vid}-->{link(file_html(name))}<!--/v:{vid}-->"
 
 
 TIP_PAD = "<!--pad-->"                           # where a fold's indent goes inside a file's note
@@ -12279,6 +17133,24 @@ def note_html(note):
     return f"{TIP_NOTE}<table cellspacing='0' cellpadding='0'>{rows}</table>{TIP_NOTE_END}"
 
 
+_TIP_ICONS = {}
+
+
+def tip_icon(kind):
+    """A file icon (file_icon) for a tooltip's rich text: drawn once into the app's scratch folder,
+    like the priority badges (a tooltip shows images, not icons)."""
+    if QApplication.instance() is None:
+        return ""                                    # no window (a check run from the command line)
+    key = (kind, tip_scale())
+    if key in _TIP_ICONS:
+        return _TIP_ICONS[key]
+    size = max(12, round(QFontMetricsF(QApplication.font()).height() * 0.95))
+    path = save_tip_image(lambda p: p.drawImage(QRectF(0, 0, size, size), file_icon_image(kind, round(size * tip_scale()))),
+                          size, size, f"kind_{kind}")
+    _TIP_ICONS[key] = f"<img src='{path.as_posix()}' width='{size}' height='{size}' style='vertical-align: middle'>"
+    return _TIP_ICONS[key]
+
+
 def _kind_block(b):
     """One kind of file in a tooltip, folded: a line with what it is (its extension when that
     isn't known) and how many. A click on it lists its files, another folds it back (ScrollTip)."""
@@ -12288,9 +17160,12 @@ def _kind_block(b):
     n, total = b.get("count") or len(b["lines"]), b.get("total")
     # of how many of its kind the mod has in all, when known: "Textures 3/10"
     of = f"<span style='color:{C['file_ext']}'>/{total}</span>" if total and total >= n else ""
-    head = lambda arrow: (f"<span style='color:{C['kind_light']}'>{arrow}&nbsp; {html.escape(label)}</span>"
-                          f"&nbsp;&nbsp;<span style='color:{C['kind_deep']}'>{n}</span>{of}")
-    key = hashlib.sha1("".join(b["lines"]).encode("utf-8", "replace")).hexdigest()[:16]
+    icon = tip_icon(file_icon_kind("x" + b["kind"]) if b["kind"].startswith(".") else "file")
+    head = lambda arrow: (f"<span style='color:{C['silver']}'>{arrow}&nbsp; {icon}&nbsp;{html.escape(label)}</span>"
+                          f"&nbsp;&nbsp;<span style='color:{C['silver']}'>{n}</span>{of}")
+    # the same files can be listed in another mod's tooltip with that mod's own totals ("3/5"
+    # there, "3/607" here): the key covers the line over them too, so opening never swaps in theirs
+    key = hashlib.sha1((head("") + "".join(b["lines"])).encode("utf-8", "replace")).hexdigest()[:16]
     link = lambda to, arrow: f"<a href='{to}:{key}' style='text-decoration:none'>{head(arrow)}</a>"
     folded = link("open", "▸")
     pad = "&nbsp;" * 5                           # its files sit under the label, past the arrow
@@ -12316,16 +17191,19 @@ def tip_columns(head, lines, k):
             f"<td style='padding-right:0px'>{'&nbsp;' * 5}</td>{cells}</tr></table>")
 
 
-def file_groups(entries, me=(), winner=False, prio=None, win=None, totals=None):
+def file_groups(entries, me=(), winner=False, prio=None, win=None, totals=None, links=None, all_used=False):
     """Files for a tooltip, compact: grouped by the mods involved, which are listed once per
     group, one per line, in load order. entries: [(in-game path, mods in load order, note)].
-    With winner=True the first mod's copy is the one used: it's bold white and the others are
-    grey. Bold means only that, everywhere: this copy wins. (me is kept for callers; unused.)
+    With winner=True the first mod's copy is the one used: it's blue and bold, the others
+    grey. Blue means only that, everywhere: this copy wins. (me is kept for callers; unused.)
     Two files with the same name (items/ and items_plus/, say) share a line, with their folders.
     Files are listed by kind, story first; a mesh's .buffer files go on the mesh's own line.
     A thin line parts one group of mods from the next. totals ({extension: n}): how many files of
-    each kind the mod has in all, shown after each kind's count ("Textures 3/10")."""
+    each kind the mod has in all, shown after each kind's count ("Textures 3/10"). links ({path:
+    merge key}): those files are a link that opens the merged file (see MergedScriptDialog).
+    all_used: every mod's copy went in (merged), so every one is blue and bold."""
     me = {me} if isinstance(me, str) else set(me)
+    links = links or {}
     groups = {}
     labels = {}                                     # a line shown as something else than its path
     for entry in entries:
@@ -12339,13 +17217,16 @@ def file_groups(entries, me=(), winner=False, prio=None, win=None, totals=None):
         mods = []
         for i, name in enumerate(key):
             if winner:                          # bold white: its copy is used; grey: overridden
-                shown = f"<b>{html.escape(name)}</b>" if i == 0 else f"<span style='color:{ash}'>{html.escape(name)}</span>"
+                shown = f"<b style='color:{C['winner']}'>{html.escape(name)}</b>" if i == 0 \
+                    else f"<span style='color:{ash}'>{html.escape(name)}</span>"
                 top = (win or {}).get(key[0])
                 if i > 0 and top and (win or {}).get(name) and win[name] != top:
-                    # a click makes this one win over the bold one (see ScrollTip, MainWindow.make_win)
+                    # a click makes this one win over the blue one (see ScrollTip, MainWindow.make_win)
                     shown = f"<a href='win:{win[name]}:{top}' style='text-decoration:none'>{shown}</a>"
+            elif all_used:                      # merged: every mod's changes went in, all used
+                shown = f"<b style='color:{C['winner']}'>{html.escape(name)}</b>"
             else:
-                shown = html.escape(name)       # merged: every mod's changes went in, all equal
+                shown = html.escape(name)
             mods.append((name, shown))
         # a mesh's data (x.w2mesh.1.buffer) rides on the mesh's line when the mesh is listed too
         paths = {p.lower(): p for p, _n in files}
@@ -12366,12 +17247,12 @@ def file_groups(entries, me=(), winner=False, prio=None, win=None, totals=None):
         rank = lambda p: (-1, 0, "") if p in labels else _kind_rank(kind(p))
         extra = {}
         for path, note in sorted(kept, key=lambda f: (rank(f[0]), shown_as(f[0]).lower(), f[0].lower())):
-            k = (shown_as(path), note)
+            k = (shown_as(path), note, links.get(path))           # a linked file keeps a line of its own
             joined.setdefault(k, []).append("" if path in labels else Path(path).parent.name)
             for b in buffers.get(path.lower(), ()):
                 extra.setdefault(k, []).append(b)
         blocks, last = [], None
-        for (name, note), folders in joined.items():
+        for (name, note, link), folders in joined.items():
             many = len(folders) if name in labels.values() else 0   # a labelled line stands for this many
             files_here = len(folders)                               # one entry per file on this line
             folders = [f for f in folders if f]
@@ -12382,7 +17263,9 @@ def file_groups(entries, me=(), winner=False, prio=None, win=None, totals=None):
             last = this
             blocks[-1]["count"] += max(1, files_here)               # twins on one line count each
             line = file_html(name)
-            bufs = sorted(set(extra.get((name, note), ())))
+            if link:
+                line = _view_link(link, name)
+            bufs = sorted(set(extra.get((name, note, link), ())))
             if bufs:
                 line += f"&nbsp;&nbsp;<span style='color:{C['file_ext']}'>+ {html.escape(' '.join(bufs))}</span>"
             if len(folders) > 1:
@@ -12411,19 +17294,56 @@ def file_groups(entries, me=(), winner=False, prio=None, win=None, totals=None):
     return [g + rule if k < len(out) - 1 else g for k, g in enumerate(out)]
 
 
+
+def fn_groups(entries, prio=None):
+    """Script functions for a tooltip, laid out like file clashes (file_groups): grouped by the
+    mods involved, listed once per group with their priorities (the one used blue and bold, the rest
+    grey), then a line below them each function in white, with the loose scripts that lose under
+    it. entries: [(function, mods used, other mods, files, note)]. A thin line parts the groups."""
+    groups = {}
+    for entry in entries:
+        shown, used, others, files, note = entry[:5]
+        groups.setdefault((tuple(used), tuple(others)), []).append((shown, files, note, entry[5] if len(entry) > 5 else None))
+    ash, silver = C["ash"], C["silver"]
+    out = []
+    for (used, others), fns in sorted(groups.items(), key=lambda g: (-len(g[1]), [x.lower() for x in g[0][0] + g[0][1]])):
+        mods = [(n, f"<b style='color:{C['winner']}'>{html.escape(n)}</b>") for n in used] + \
+               [(n, f"<span style='color:{ash}'>{html.escape(n)}</span>") for n in others]
+        listed = mod_lines(mods, prio)
+        inner = []
+        for shown, files, note, link in sorted(fns, key=lambda f: f[0].lower()):
+            # with a link: the precompiled mod's own version of it opens on a click
+            b = _blob_link(link, shown) if link else f"<span style='color:{C['silver']}'>{html.escape(shown)}</span>"
+            if files:
+                b += "<br>" + "<br>".join(file_html(f"content/scripts/{f}") for f in files)
+            if note:
+                b += f"<br><span style='color:{ash}'>{html.escape(note)}</span>"
+            inner.append(b)
+        top = 0 if out else 10
+        if listed.startswith("<table"):
+            body = "".join(f"<p style='margin:{0 if k == 0 else 7}px 0 0 0'>{b}</p>" for k, b in enumerate(inner))
+            out.append(listed.replace("<table ", f"<table style='margin-top:{top}px; color:{silver}' ", 1)
+                       .replace("</table>", f"<tr><td></td><td style='padding-top:18px'>{body}</td></tr></table>"))
+        else:
+            body = "".join(f"<p style='margin:{18 if k == 0 else 7}px 0 0 0'>{b}</p>" for k, b in enumerate(inner))
+            out.append(f"<p style='margin:{top + 2 if out else 12}px 0 0 0; color:{silver}'>{listed}</p>" + body)
+    rule = (f"<table width='100%' style='margin-top:12px' cellspacing='0' cellpadding='0'><tr>"
+            f"<td style='border-top:1px solid {C['tip_rule']}; font-size:1px'>&nbsp;</td></tr></table>")
+    return [g + rule if k < len(out) - 1 else g for k, g in enumerate(out)]
+
 # Explanations in a tooltip wrap to the width of what it lists (file and mod names), never
 # widening it themselves. They're marked so ScrollTip can measure the tooltip without them.
 TIP_NOTE, TIP_NOTE_END = "<!--note-->", "<!--/note-->"
 _TIP_NOTES = re.compile(re.escape(TIP_NOTE) + ".*?" + re.escape(TIP_NOTE_END), re.S)
 
 
-def tip_section(title, colour, blocks, note="", rich=False):
+def tip_section(title, colour, blocks, note="", rich=False, rich_note=False):
     """A coloured title, an optional grey line on what it means, then the blocks. Everything
     is a paragraph, so Qt's spacing stays even. rich: the title is HTML, coloured by its own
-    parts (the title's colour is then only the default)."""
+    parts (the title's colour is then only the default). rich_note: the note is HTML too."""
     head = f"<p style='margin:0'><b style='color:{C[colour]}'>{title if rich else html.escape(title)}</b>"
     if note:
-        head += f"<br>{TIP_NOTE}<span style='color:{C['ash']}'>{html.escape(note)}</span>{TIP_NOTE_END}"
+        head += f"<br>{TIP_NOTE}<span style='color:{C['ash']}'>{note if rich_note else html.escape(note)}</span>{TIP_NOTE_END}"
     head += "</p>"
     return head + "".join(b if b.startswith("<p") else f"<p style='margin:10px 0 0 0'>{b}</p>" for b in blocks)
 
@@ -12442,6 +17362,7 @@ class ScrollTip(QFrame):
     with "more" at the bottom while there's more below. Stays open while the pointer is on
     its cell or on the tip itself, so you can move onto it to scroll."""
     winClicked = pyqtSignal(str, str)          # a mod's name clicked: (that mod, the one it should win over)
+    viewClicked = pyqtSignal(object)           # a merged file clicked (its merge key), or a function ("blob", …)
     PAD = 24                                   # air between the tip and the screen edges
     PANEL = 56                                 # room kept for a bottom panel Qt can't see
     SHADOW = 16                                # transparent margin around the box, for its shadow
@@ -12540,6 +17461,8 @@ class ScrollTip(QFrame):
         self.text.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         self.text.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse)
         self.text.linkActivated.connect(self._toggle_kind)     # a folded kind of file: open or fold it
+        self.text.linkHovered.connect(self._hover)            # a merged file under the mouse lights up
+        self._hot = None
         self._pos = self._placed = None
         self.area.setWidget(self.text)
         self.area.viewport().installEventFilter(self)       # the scrollbar coming or going re-wraps
@@ -12576,12 +17499,36 @@ class ScrollTip(QFrame):
             bar.style().polish(bar)
             bar.update()
 
+    def _hover(self, href):
+        """A merged file's link under the mouse: its brighter copy in, and the plain one back
+        when the mouse leaves it."""
+        what, _, vid = href.partition(":")
+        vid = vid if what == "view" and vid in _VIEWS else None
+        if vid == self._hot:
+            return
+        src = self.text.text()
+        for k, part in ((self._hot, 1), (vid, 2)):
+            if k and k in _VIEWS:
+                mark = re.compile(r"(<!--v:" + k + r"-->).*?(<!--/v:" + k + r"-->)", re.S)
+                src = mark.sub(lambda m: m.group(1) + _VIEWS[k][part] + m.group(2), src)
+        self._hot = vid
+        if src != self.text.text():
+            keep = self.area.verticalScrollBar().value()
+            self.text.setText(src)
+            self.area.verticalScrollBar().setValue(keep)
+
     def _toggle_kind(self, href):
         """A click on a folded kind of file (see _kind_block): swap it for its files, or back."""
         what, _, key = href.partition(":")
         if what == "win":
             mid, _, over = key.partition(":")
             self.winClicked.emit(mid, over)
+            return
+        if what == "view":
+            if key in _VIEWS:
+                self._hover("")
+                self.hide()
+                self.viewClicked.emit(_VIEWS[key][0])
             return
         pair = _FOLDS.get(key)
         if pair is None or what not in ("open", "fold") or self._pos is None:
@@ -12645,6 +17592,7 @@ class ScrollTip(QFrame):
 
     def show_tip(self, html_text, pos, anchor, at=None):
         self._pos = pos
+        self._hot = None                       # nothing lit up in a new tip
         self.anchor = anchor                   # the room keeps its row within reach
         screen = QApplication.screenAt(pos) or QApplication.primaryScreen()
         avail = self.room(screen)
@@ -12870,6 +17818,7 @@ class ModTree(QTreeWidget):
     orderChanged = pyqtSignal()
     filesDropped = pyqtSignal(list)
     collapseChanged = pyqtSignal(str, bool)
+    menuClicked = pyqtSignal(str)                    # a mod's menu sign clicked: its id
 
     def __init__(self):
         super().__init__()
@@ -12995,7 +17944,23 @@ class ModTree(QTreeWidget):
                 return c[2], QRect(self.viewport().mapToGlobal(box.topLeft()), box.size())
         return None
 
+    menu_hover = None                                # the mod whose menu sign the pointer is on
+
+    def menu_sign_at(self, pos):
+        """The id of the mod whose menu sign is under a viewport point, or None."""
+        idx = self.indexAt(pos)
+        if idx.isValid() and idx.column() == NAME_COL and idx.data(MENU_ROLE):
+            if RowDelegate.menu_rect(self.visualRect(idx)).adjusted(-5, -8, 5, 8).contains(QPointF(pos)):
+                return idx.sibling(idx.row(), 0).data(Qt.ItemDataRole.UserRole)
+        return None
+
     def viewportEvent(self, e):
+        if e.type() == QEvent.Type.MouseButtonPress and e.button() == Qt.MouseButton.LeftButton:
+            mid = self.menu_sign_at(e.position().toPoint())
+            if mid:
+                self.tip.hide_tip()
+                self.menuClicked.emit(str(mid))
+                return True
         if e.type() == QEvent.Type.ToolTip:
             hit = self.chip_at(e.pos())
             if hit:
@@ -13010,6 +17975,10 @@ class ModTree(QTreeWidget):
                 return True                                  # beside the chips: no tooltip
         elif e.type() == QEvent.Type.MouseMove:
             local = e.position().toPoint()
+            if not e.buttons():
+                over = self.menu_sign_at(local)
+                self.viewport().setCursor(Qt.CursorShape.PointingHandCursor if over else Qt.CursorShape.ArrowCursor)
+                self._menu_hover_to(over)
             self.tip.pointer_at(self.viewport().mapToGlobal(local))
             if self.tip.isVisible():
                 # moving straight onto the next chip swaps the tooltip at once, without waiting
@@ -13020,8 +17989,17 @@ class ModTree(QTreeWidget):
         elif e.type() == QEvent.Type.Enter:
             self.tip._in_view = True
         elif e.type() == QEvent.Type.Leave:
+            self._menu_hover_to(None)
             self.tip.pointer_left()             # the tip decides: onto it, or gone
         return super().viewportEvent(e)
+
+    def _menu_hover_to(self, mid):
+        """The menu sign under the pointer turns gold: the row it left and the row it's on redrawn."""
+        old = getattr(self, "menu_hover", None)
+        if old == mid:
+            return
+        self.menu_hover = mid
+        self.viewport().update()                     # only when the pointer moves onto or off a sign
 
     def keyPressEvent(self, e):
         if self.tip.isVisible():
@@ -13119,6 +18097,65 @@ class ModTree(QTreeWidget):
         self.orderChanged.emit()
 
 
+WINE_DPI_KEY = r"HKCU\Control Panel\Desktop"     # where Wine keeps its DPI (LogPixels: 96 is 100%)
+
+
+def _wine_reg(exe, prefix, *args):
+    env = dict(os.environ, WINEPREFIX=str(prefix), WINEDEBUG="-all")
+    return subprocess.run([exe, "reg", *args], env=env, capture_output=True, text=True,
+                          errors="replace", timeout=90)
+
+
+def wine_logpixels(exe, prefix):
+    """The DPI a Wine prefix gives its programs (LogPixels), or None when it has none set."""
+    r = _wine_reg(exe, prefix, "query", WINE_DPI_KEY, "/v", "LogPixels")
+    m = re.search(r"LogPixels\s+REG_DWORD\s+0x([0-9a-fA-F]+)", r.stdout or "")
+    return int(m.group(1), 16) if r.returncode == 0 and m else None
+
+
+def prefix_logpixels(prefix):
+    """The same, read straight from the prefix's user.reg (no Wine started, so no wait): an int,
+    None when it has none set, or False when the file can't be read (ask Wine then)."""
+    try:
+        text = (Path(prefix) / "user.reg").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    inside = False
+    for line in text.splitlines():
+        if line.startswith("["):
+            inside = line.split("]", 1)[0].lower() == "[control panel\\\\desktop"
+            continue
+        if inside:
+            m = re.match(r'"LogPixels"=dword:([0-9a-fA-F]+)', line.strip())
+            if m:
+                return int(m.group(1), 16)
+    return None
+
+
+def wine_set_logpixels(exe, prefix, value):
+    """Set a prefix's DPI (None: take it out, so Wine's own default applies). -> it worked."""
+    if value is None:
+        r = _wine_reg(exe, prefix, "delete", WINE_DPI_KEY, "/v", "LogPixels", "/f")
+        return r.returncode == 0 or wine_logpixels(exe, prefix) is None
+    r = _wine_reg(exe, prefix, "add", WINE_DPI_KEY, "/v", "LogPixels", "/t", "REG_DWORD", "/d", str(int(value)), "/f")
+    return r.returncode == 0
+
+
+def wine_wait_closed(prefix, timeout=60):
+    """Wait until everything Wine runs in this prefix has closed (its wineserver exits a few
+    seconds after the last program): a second Script Merger started sooner fails. -> it closed."""
+    server = shutil.which("wineserver")
+    env = dict(os.environ, WINEPREFIX=str(prefix), WINEDEBUG="-all")
+    if server:
+        try:
+            subprocess.run([server, "-w"], env=env, capture_output=True, timeout=timeout)
+            return True
+        except (OSError, subprocess.SubprocessError):
+            return False
+    time.sleep(4)                                    # no wineserver command: its usual linger
+    return True
+
+
 def merger_ok(path):
     """Is this a Script Merger program that exists? Only then is it offered in the menu."""
     if not path:
@@ -13205,7 +18242,9 @@ class SetupDialog(RememberingDialog):
         self.login_btn.clicked.connect(self._login_clicked)
         self.key = QLineEdit(cfg.get("nexus_key", ""))
         self.key.setEchoMode(QLineEdit.EchoMode.Password)
-        self.key.setPlaceholderText("the developer's own key, for testing")
+        self.key.setPlaceholderText("your personal API key, for testing")
+        self.key.setToolTip("From the API Keys page of your Nexus account. Only for testing, until\n"
+                            "this app has its Nexus login.")
         show = QPushButton("Show")
         show.setCheckable(True)
         show.toggled.connect(lambda on: (self.key.setEchoMode(
@@ -13216,9 +18255,9 @@ class SetupDialog(RememberingDialog):
             for w in (self.key, show):
                 w.hide()
             self._show_login()
-        elif nexus_on(cfg):
+        elif NEXUS_TESTING:
             heading("Nexus")
-            line("API key", self.key, show)               # the developer's own key: the old field
+            line("API key", self.key, show)               # a testing build: a personal key
             for w in (self.login_state, self.login_btn):
                 w.hide()
         else:
@@ -13239,7 +18278,7 @@ class SetupDialog(RememberingDialog):
         self.code_size.setValue(int(round(code_size())))
         self.code_size.setToolTip("Code size")
         line("Code font", self.code_font, self.code_size,
-             "The font for code in Script decisions.\n"
+             "The font for code in Script decisions and merged files.\n"
              "JetBrains Mono reads best. On Fedora: sudo dnf install jetbrains-mono-fonts-all")
         self.font_preview = QLabel()
         self.font_preview.setTextFormat(Qt.TextFormat.RichText)
@@ -13250,6 +18289,16 @@ class SetupDialog(RememberingDialog):
         self.code_font.currentTextChanged.connect(self._preview_font)
         self.code_size.valueChanged.connect(self._preview_font)
         self._preview_font()
+        heading("Mod list")
+        self.chip_counts = QCheckBox("Show counts on status chips")
+        self.chip_counts.setChecked(bool(load_config().get("chip_counts", False)))
+        line("Status", self.chip_counts, tip="Off: chips show just their icon. The count is in each tooltip's title.")
+        self.flatten_menus = QCheckBox("Open a mod's only menu page directly")
+        self.flatten_menus.setChecked(bool(load_config().get("flatten_menus", True)))
+        line("Game menu", self.flatten_menus,
+             tip="In the game's Mods menu, a mod whose folder holds a single page opens it straight away\n"
+                 "(Mods › Dynamic Scabbards, not Mods › Dynamic Scabbards › Settings). A mod with several\n"
+                 "pages keeps its folder. The mod's own files aren't changed; its settings keep working.")
         v.addLayout(grid)
 
         # the old Script Merger, for anyone who still wants to run it: its own card, since
@@ -13263,8 +18312,11 @@ class SetupDialog(RememberingDialog):
         # folds to one line: the heading, and how it stands on the right
         head_row = QHBoxLayout()
         head_row.setSpacing(8)
+        self.merger_chevron = ChevronButton()               # the same arrow as the Install window's cards
+        head_row.addWidget(self.merger_chevron)
         self.merger_head = QPushButton(objectName="CardHead")
         self.merger_head.setCheckable(True)
+        self.merger_chevron.clicked.connect(self.merger_head.toggle)
         self.merger_head.setCursor(Qt.CursorShape.PointingHandCursor)
         self.merger_head.setToolTip(
             "Scripts are merged by the app. To run Script Merger yourself, set its path:\n"
@@ -13389,7 +18441,9 @@ class SetupDialog(RememberingDialog):
     def _fold_merger(self, opened, remember=True):
         was_h = self.merger_body.height() if self.merger_body.isVisible() else 0
         self.merger_body.setVisible(opened)
-        self.merger_head.setText(("▾" if opened else "▸") + "   Legacy Script Merger")
+        self.merger_head.setText("Legacy Script Merger")
+        self.merger_chevron.set_open(opened)
+        self.merger_chevron.setToolTip("Collapse" if opened else "Expand")
         self.merger_summary.setVisible(not opened)      # the full line shows inside when open
         if remember:
             cfg = load_config()
@@ -13557,7 +18611,9 @@ class SetupDialog(RememberingDialog):
                    {"nexus_key": self.key.text().strip()} if self.key.isVisibleTo(self) else {}),
                 "merger_path": self.merger.text().strip(),
                 "code_font": self.code_font.currentText(),
-                "code_size": self.code_size.value()}
+                "code_size": self.code_size.value(),
+                "chip_counts": self.chip_counts.isChecked(),
+                "flatten_menus": self.flatten_menus.isChecked()}
 
 
 _NG_WORDS = re.compile(r"(?<![a-z])(ng|next[ _-]?gen(eration)?|nextgen|new[ _-]?gen|4\.\d+|v4|dx12|x64_dx12)(?![a-z])", re.I)
@@ -13669,8 +18725,183 @@ def list_files(src):
     return out
 
 
-def fill_path_tree(tree, paths, count_col=1):
-    """Show a flat list of relative paths as a folder tree with per-folder counts."""
+# --- file icons for the folder trees (Install window, a mod's files) ---------------------------
+# Drawn in code like the menu icons: no image files, the app's own colours, sharp at any scaling.
+# A folder is solid gold; a file is a sheet (or a sign of its own) outlined in its kind's colour.
+FILE_ICON_KINDS = {
+    "script": (".ws",),
+    "blob": (".rsblob",),
+    "image": (".xbm", ".dds", ".png", ".jpg", ".jpeg", ".tga", ".bmp", ".texarray", ".webp"),
+    "model": (".w2mesh", ".buffer", ".w2mi", ".w2rig", ".w3fac", ".w2ragdoll", ".redcloth", ".redfur", ".w3dyng",
+              ".w2ent", ".w3app", ".w2anims", ".w2animev", ".w2mg", ".redapex", ".reddest"),
+    "bundle": (".bundle", ".cache", ".store", ".zip", ".7z", ".rar"),
+    "sound": (".wem", ".bnk", ".ogg", ".wav", ".mp3", ".opus", ".flac"),
+    "talk": (".w3strings", ".w2scene", ".w2cutscene"),
+    "quest": (".journal", ".w2quest", ".w2phase", ".w2qm", ".w2je", ".w2behtree", ".w2comm", ".spawntree", ".w2j"),
+    "data": (".xml", ".csv", ".ini", ".txt", ".settings", ".json", ".yml", ".yaml", ".cfg", ".md", ".log",
+             ".reddlc", ".redgame", ".bat", ".sh"),
+    "ui": (".redswf", ".w2fnt", ".swf"),
+    "binary": (".dll", ".exe", ".asi", ".so"),
+    "world": (".w2w", ".w2l", ".w2ter", ".env", ".vbrush", ".flyr", ".srt", ".grassmask", ".w2sf", ".navmesh",
+              ".w2p", ".w2fx", ".w2em", ".w2steer"),
+}
+_ICON_OF_EXT = {ext: kind for kind, exts in FILE_ICON_KINDS.items() for ext in exts}
+_ICON_COLOUR = {"file": "#b8c0c9", "script": C["sky"], "blob": C["bronze"], "image": C["moss"],
+                "model": "#b3a6e6", "bundle": C["bronze_muted_hi"], "sound": C["brick"], "talk": C["steel"],
+                "quest": C["bronze_hi"], "data": C["ash"], "ui": C["sky"], "binary": "#b8c0c9", "world": C["moss"]}
+_FILE_ICONS = {}
+
+
+def file_icon_kind(name):
+    """Which icon a file gets, by its name: 'folder' for one ending in '/'."""
+    low = name.lower()
+    if low.endswith("/"):
+        return "folder"
+    if low.endswith(".cache") and "sound" in low:
+        return "sound"                                  # soundspc.cache: the game's sounds
+    if re.search(r"\.w2mesh\.\d+\.buffer$", low):
+        return "model"
+    return _ICON_OF_EXT.get(Path(low).suffix, "file")
+
+
+def file_icon(kind):
+    """The icon for one kind of file (file_icon_kind), 16 px, drawn once."""
+    if kind not in _FILE_ICONS:
+        pm = QPixmap.fromImage(file_icon_image(kind, 48))
+        pm.setDevicePixelRatio(3)
+        _FILE_ICONS[kind] = QIcon(pm)
+    return _FILE_ICONS[kind]
+
+
+def file_icon_image(kind, px):
+    """A file icon drawn into an image px pixels square (an image, not a pixmap: fine for the
+    tooltips' pictures, which may be made away from the window)."""
+    img = QImage(px, px, QImage.Format.Format_ARGB32_Premultiplied)
+    img.fill(Qt.GlobalColor.transparent)
+    p = QPainter(img)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.scale(px / 16, px / 16)
+    col = QColor(_ICON_COLOUR.get(kind, _ICON_COLOUR["file"]))
+    soft = QColor(col)
+    soft.setAlphaF(0.16)
+
+    def pen(c=col, w=1.2):
+        q = QPen(c, w)
+        q.setCapStyle(Qt.PenCapStyle.RoundCap)
+        q.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        return q
+
+    def poly(*pts, close=True):
+        path = QPainterPath()
+        path.moveTo(*pts[0])
+        for q in pts[1:]:
+            path.lineTo(*q)
+        if close:
+            path.closeSubpath()
+        return path
+
+    def sheet():
+        p.setPen(pen())
+        p.setBrush(soft)
+        p.drawPath(poly((3.5, 1.5), (9.5, 1.5), (12.5, 4.5), (12.5, 14.5), (3.5, 14.5)))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(poly((9.5, 1.5), (9.5, 4.5), (12.5, 4.5), close=False))
+
+    if kind == "folder":
+        gold, dark = QColor("#e2bf6e"), QColor("#b8923f")
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(dark)
+        p.drawPath(poly((1.5, 3), (6, 3), (7.5, 4.5), (14.5, 4.5), (14.5, 13), (1.5, 13)))
+        p.setBrush(gold)
+        p.drawRoundedRect(QRectF(1.5, 6, 13, 7.5), 1.2, 1.2)
+    elif kind in ("file", "data"):
+        sheet()
+        if kind == "data":
+            p.setPen(pen(w=1.1))
+            for y in (7.5, 9.7, 11.9):
+                p.drawLine(QPointF(5.5, y), QPointF(10.5, y))
+    elif kind in ("script", "blob"):
+        sheet()
+        p.setPen(pen(w=1.25))
+        p.drawPath(poly((7, 7.2), (5.4, 9.3), (7, 11.4), close=False))
+        p.drawPath(poly((9, 7.2), (10.6, 9.3), (9, 11.4), close=False))
+    elif kind == "image":
+        p.setPen(pen())
+        p.setBrush(soft)
+        p.drawRoundedRect(QRectF(1.5, 2.5, 13, 11), 1.6, 1.6)
+        p.setBrush(col)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawPath(poly((3, 12), (6.5, 7.5), (9, 10.3), (10.6, 8.6), (13, 12)))
+        p.setBrush(QColor(C["bronze_hi"]))
+        p.drawEllipse(QPointF(10.6, 5.6), 1.3, 1.3)
+    elif kind == "model":
+        p.setPen(pen())
+        p.setBrush(soft)
+        p.drawPath(poly((8, 1.8), (13.6, 4.8), (13.6, 11.2), (8, 14.2), (2.4, 11.2), (2.4, 4.8)))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(poly((2.4, 4.8), (8, 7.8), (13.6, 4.8), close=False))
+        p.drawLine(QPointF(8, 7.8), QPointF(8, 14.2))
+    elif kind == "bundle":
+        p.setPen(pen())
+        p.setBrush(soft)
+        p.drawRoundedRect(QRectF(2, 5, 12, 9), 1.2, 1.2)
+        p.drawRoundedRect(QRectF(1.5, 2.5, 13, 3), 1, 1)
+        p.drawLine(QPointF(6.5, 8), QPointF(9.5, 8))
+    elif kind == "sound":
+        p.setPen(pen(w=1.3))
+        p.drawPath(poly((6.5, 12), (6.5, 3.2), (13, 2), (13, 10.8), close=False))
+        p.setBrush(col)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(QPointF(4.8, 12.2), 2.1, 1.7)
+        p.drawEllipse(QPointF(11.3, 11), 2.1, 1.7)
+    elif kind == "talk":
+        p.setPen(pen())
+        p.setBrush(soft)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(1.5, 2.5, 13, 9), 2.5, 2.5)
+        path = path.united(poly((4.5, 10.5), (4, 14), (8, 11)))
+        p.drawPath(path)
+        p.setPen(pen(w=1.1))
+        p.drawLine(QPointF(4.5, 6), QPointF(11.5, 6))
+        p.drawLine(QPointF(4.5, 8.3), QPointF(9.5, 8.3))
+    elif kind == "quest":
+        p.setPen(pen())
+        p.setBrush(soft)
+        p.drawPath(poly((8, 3.6), (8, 13.6), (1.8, 12.4), (1.8, 2.4)))
+        p.drawPath(poly((8, 3.6), (14.2, 2.4), (14.2, 12.4), (8, 13.6)))
+    elif kind == "ui":
+        p.setPen(pen())
+        p.setBrush(soft)
+        p.drawRoundedRect(QRectF(1.5, 2.5, 13, 11), 1.6, 1.6)
+        p.drawLine(QPointF(1.5, 5.6), QPointF(14.5, 5.6))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(col)
+        p.drawRoundedRect(QRectF(3.8, 8, 4, 3.4), 0.6, 0.6)
+    elif kind == "binary":
+        p.setPen(pen(w=1.25))
+        p.setBrush(soft)
+        teeth = QPainterPath()
+        for k in range(8):
+            a = k * math.pi / 4
+            teeth.addEllipse(QPointF(8 + 5.2 * math.cos(a), 8 + 5.2 * math.sin(a)), 1.25, 1.25)
+        body = QPainterPath()
+        body.addEllipse(QPointF(8, 8), 4.6, 4.6)
+        p.drawPath(body.united(teeth))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawEllipse(QPointF(8, 8), 1.8, 1.8)
+    elif kind == "world":
+        p.setPen(pen())
+        p.setBrush(soft)
+        p.drawPath(poly((8, 1.6), (12.6, 7.4), (10.4, 7.4), (13.6, 11.8), (2.4, 11.8), (5.6, 7.4), (3.4, 7.4)))
+        p.drawLine(QPointF(8, 11.8), QPointF(8, 14.6))
+    p.end()
+    return img
+
+
+def fill_path_tree(tree, paths, count_col=1, sizes=None, size_col=2):
+    """Show a flat list of relative paths as a folder tree with per-folder counts, each row with
+    its icon (file_icon). sizes ({path: bytes}): each file's size and each folder's total, in
+    column size_col, right-aligned."""
     dirs, files = set(), {}
     for rel in paths:
         d, _, f = rel.rpartition("/")
@@ -13680,12 +18911,24 @@ def fill_path_tree(tree, paths, count_col=1):
             d = d.rpartition("/")[0]
     files = {d: list(v.values()) for d, v in files.items()}
     counts = {d: 0 for d in dirs}
+    totals = {d: 0 for d in dirs}
+    sizes = sizes or {}
     for d, fl in files.items():
+        got = sum(sizes.get(f"{d}/{f}" if d else f, 0) for f in fl)
         p = d
         while p:
             counts[p] += len(fl)
+            totals[p] += got
             p = p.rpartition("/")[0]
 
+    def put_size(it, n):
+        if sizes and size_col is not None:
+            it.setText(size_col, human_size(n))
+            it.setTextAlignment(size_col, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            it.setForeground(size_col, QBrush(QColor(C["ash"])))
+
+    tree.setIconSize(QSize(16, 16))
+    soft_branch_selection(tree)
     tree.setUpdatesEnabled(False)
     tree.clear()
     grey = QBrush(QColor(C["ash"]))
@@ -13693,14 +18936,18 @@ def fill_path_tree(tree, paths, count_col=1):
     for d in sorted(dirs, key=lambda x: x.lower()):          # parents sort before children
         parent, _, leaf = d.rpartition("/")
         it = QTreeWidgetItem([leaf + "/", str(counts[d])])
+        it.setIcon(0, file_icon("folder"))
         it.setTextAlignment(count_col, Qt.AlignmentFlag.AlignRight)
+        put_size(it, totals[d])
         (nodes[parent].addChild if parent else tree.addTopLevelItem)(it)
         nodes[d] = it
     for d, fl in files.items():
         parent = nodes.get(d)
         for f in sorted(fl, key=str.lower):
             it = QTreeWidgetItem([f])
+            it.setIcon(0, file_icon(file_icon_kind(f)))
             it.setForeground(0, grey)
+            put_size(it, sizes.get(f"{d}/{f}" if d else f, 0))
             (parent.addChild if parent else tree.addTopLevelItem)(it)
 
     # collapsed by default; mods/ and dlc/ open one level so the folder names are visible
@@ -13997,7 +19244,7 @@ def _char_changes(old, new):
 
 def _rows_vs_base(base_region, lines, first_num, split_unpaired=False):
     """A version of the region against vanilla: unchanged lines keep their vanilla line
-    number, new or changed ones are tinted, with the changed characters marked.
+    number, new or changed ones get a gold number (the changed character ranges are kept with them).
     split_unpaired: a replaced line that isn't an edit of the one it replaces (XML: another
     entry) shows as removed, not as the new line's older self."""
     rows = []
@@ -14032,8 +19279,109 @@ def _rows_vs_base(base_region, lines, first_num, split_unpaired=False):
     return rows
 
 
+def _line_opcodes(a, b):
+    """difflib-style opcodes between two files' lines, by the merger's own fast line matching
+    (trailing spaces and tab/space indentation don't count): a whole game script in a blink."""
+    out, pa, pb = [], 0, 0
+    for i, j, k in _matching_blocks(_norm(a), _norm(b)) + [(len(a), len(b), 0)]:
+        if i > pa or j > pb:
+            out.append(("replace" if i > pa and j > pb else "delete" if i > pa else "insert", pa, i, pb, j))
+        if k:
+            out.append(("equal", i, i + k, j, j + k))
+        pa, pb = i + k, j + k
+    return out
+
+
+def _touches(a1, a2, b1, b2):
+    """Do two changes to the game's lines meet: two stretches that overlap, or a stretch and an
+    addition at a spot inside or at its edge, or two additions at the same spot."""
+    if a1 < a2 and b1 < b2:
+        return a1 < b2 and b1 < a2
+    if a1 == a2 and b1 == b2:
+        return a1 == b1
+    if a1 == a2:
+        return b1 <= a1 <= b2
+    return a1 <= b1 <= a2
+
+
+def original_rows(base, merged):
+    """The game's own file against what the merge made of it: (rows for CodeView, the row runs
+    the merge changed or took out, {merged line index: the game's line index} for the lines both
+    have). Lines keep the game's numbers; the ones the merge changed are "chg" (a gold number),
+    the rest "same" (greyed out)."""
+    kept, both = set(), {}
+    for tag, i1, i2, j1, j2 in _line_opcodes(base, merged):
+        if tag == "equal":
+            kept.update(range(i1, i2))
+            both.update((j1 + k, i1 + k) for k in range(i2 - i1))
+    rows = [(i + 1, line, "same" if i in kept else "chg", ()) for i, line in enumerate(base)]
+    runs, i = [], 0
+    while i < len(base):
+        if i in kept:
+            i += 1
+            continue
+        k = i
+        while k < len(base) and k not in kept:
+            k += 1
+        runs.append((i, k - 1))
+        i = k
+    return rows, runs, both
+
+
+def merged_rows(base, merged, versions, near=3):
+    """A whole merged file against the game's: (rows for CodeView, the row each change starts on).
+    Lines keep their number in the merged file (what the game's compile errors point at);
+    unchanged ones are kind "same", changed ones "add" with their changed characters, the
+    game's lines a change took out one "del" row. Each change starts with a "who" row naming the
+    mods whose own copies make it; one mod's edits no more than `near` lines apart are one change.
+    versions: [(label, lines)] of the mods merged."""
+    norm = lambda l: l.strip()
+    mods = []                                      # (label, its own changes: [(i1, i2, its new lines)])
+    for label, lines in versions:
+        mods.append((label, [(i1, i2, {norm(l) for l in lines[j1:j2] if norm(l)})
+                             for tag, i1, i2, j1, j2 in _line_opcodes(base, lines) if tag != "equal"]))
+    ops = _line_opcodes(base, merged)
+    whose = {}
+    for n, (tag, i1, i2, j1, j2) in enumerate(ops):
+        if tag != "equal":
+            new = {norm(l) for l in merged[j1:j2] if norm(l)}
+            gone = {i for i in range(i1, i2) if norm(base[i]) not in new}    # the game's lines taken out
+            who = []
+            for label, changes in mods:
+                mine = [c for c in changes if _touches(c[0], c[1], i1, i2)]
+                # its new lines are here, or it takes out lines taken out here (and what it put in
+                # their place, if anything, is here too: a version you decided against isn't named)
+                if any(c[2] & new for c in mine) or any(
+                        any(i in gone for i in range(c[0], c[1])) and c[2] <= new for c in mine):
+                    who.append(label)
+            whose[n] = tuple(dict.fromkeys(who or [l for l, _c in mods]))
+    rows, starts, last = [], [], None              # last: (who, op) of the change being shown
+    for n, (tag, i1, i2, j1, j2) in enumerate(ops):
+        if tag == "equal":
+            rows += [(j1 + k + 1, merged[j1 + k], "same", ()) for k in range(j2 - j1)]
+            continue
+        gap = ops[n - 1][4] - ops[n - 1][3] if n and ops[n - 1][0] == "equal" else 0
+        if not (last and last[0] == whose[n] and last[1] == n - 2 and gap <= near):
+            lead = next((l[:len(l) - len(l.lstrip())] for l in merged[j1:j2] + base[i1:i2] if l.strip()), "")
+            starts.append(len(rows))
+            rows.append(("", lead + " · ".join(whose[n]), "who", ()))
+        last = (whose[n], n)
+        for k in range(j1, j2):
+            spans = ()
+            paired = i1 + (k - j1)
+            if tag == "replace" and paired < i2:
+                old, line = _expand(base[paired]), _expand(merged[k])
+                if _similar(old, line):
+                    spans = tuple(_char_changes(old, line)[1])
+            rows.append((k + 1, merged[k], "add", spans))
+        gone = (i2 - i1) - (j2 - j1)
+        if gone > 0:
+            lead = next((l[:len(l) - len(l.lstrip())] for l in base[i1:i2] if l.strip()), "")
+            rows.append(("", f"{lead}{gone} line{'s' * (gone != 1)} of the game's removed", "del", ()))
+    return rows, starts
+
 def _base_rows(base_region, variants, first_num):
-    """Vanilla's region: every line some mod changed is tinted, with the characters they changed marked."""
+    """Vanilla's region: every line some mod changed gets a gold number (with the character ranges they changed)."""
     changed, spans = set(), {}
     for lines in variants:
         for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, base_region, lines,
@@ -14150,6 +19498,19 @@ def brace_mark(cursor, colour=None):
     return s
 
 
+def soft_branch_selection(tree):
+    """A folder tree's selected row the same colour all the way across: the space left of an
+    indented row (its branch) is drawn with the palette's highlight, solid bronze, where the row
+    itself has the faint bronze of every list. Given that same faint bronze, as a solid colour."""
+    a, b = QColor(C["bronze"]), QColor(C["slate"])
+    soft = QColor(*(round(0.15 * x + 0.85 * y) for x, y in zip((a.red(), a.green(), a.blue()), (b.red(), b.green(), b.blue()))))
+    pal = tree.palette()
+    for group in (QPalette.ColorGroup.Active, QPalette.ColorGroup.Inactive):
+        pal.setColor(group, QPalette.ColorRole.Highlight, soft)
+        pal.setColor(group, QPalette.ColorRole.HighlightedText, QColor(C["silver"]))
+    tree.setPalette(pal)
+
+
 def soft_selection(widget):
     """No selection colour over code: what you select keeps its colours and everything else
     fades (see fade_outside), which reads far better than a solid bronze band."""
@@ -14167,18 +19528,15 @@ def _rgba(key, alpha):
 
 
 class CodeView(QTextBrowser):
-    """Read-only code: line numbers, light syntax colours, tinted changes, marked characters.
+    """Read-only code: line numbers, light syntax colours, changed lines numbered in gold.
     Long stretches no mod touched fold into one '··· N unchanged lines' row (click to open).
     Click beside a brace to see its pair and the block between; double-click one to select
     the block. Click a name to light it up everywhere. Copying leaves the line numbers out."""
-    TINT = {"add": ("rgba(127,191,138,0.13)", "rgba(127,191,138,0.45)"),
-            "chg": ("rgba(219,185,119,0.11)", "rgba(219,185,119,0.42)")}
-    # changed lines are painted as one section per run (not a band per line): fill, left edge
-    BAND = {"add": (QColor(127, 191, 138, 46), QColor(127, 191, 138, 170)),
-            "del": (QColor(214, 106, 94, 30), QColor(214, 106, 94, 160)),
-            "chg": (QColor(219, 185, 119, 34), QColor(219, 185, 119, 150))}
+    # a changed line: its number in gold, its code in its usual colours. Nothing behind the
+    # text and no recoloured characters: both made the code hard to read
     MARK = {"add": "+", "chg": "~", "del": "−"}
     lang = "ws"                  # "xml" for XML files: their own colours
+    fade_same = False            # lines no mod changed greyed right out (the merged-file viewer)
     KEEP_NEAR = 3                # unchanged lines kept in view next to a change
     FOLD_MIN = 4                 # never fold fewer lines than this
     foldOpened = pyqtSignal(int)
@@ -14280,8 +19638,8 @@ class CodeView(QTextBrowser):
         shown_lines = []
         for num, text, kind, spans in self._rows:
             full = _expand(text)
-            if kind == "del":
-                tags = ["del"] * len(full)                # a note, not code
+            if kind in ("del", "who"):
+                tags = [kind] * len(full)                 # a note, not code
             else:
                 tags, in_comment = char_styles(self.lang)(full, in_comment)
             cut = min(dedent, _indent(text)) if full.strip() else len(full)
@@ -14293,7 +19651,7 @@ class CodeView(QTextBrowser):
                     marked[k] = True
             self._info.append({"gutter": len(gutter), "shown": shown, "text": text, "tags": tags[cut:],
                                "marked": marked, "gut": gutter, "kind": kind})
-            shown_lines.append("" if kind == "del" else shown)
+            shown_lines.append("" if kind in ("del", "who") else shown)
         _braces, self._pairs = _brace_marks(shown_lines)
         folds = self._folds()
         n = 0
@@ -14313,32 +19671,39 @@ class CodeView(QTextBrowser):
             info = self._info[n]
             kind = info["kind"]
             shown, tags, marked = info["shown"], info["tags"], info["marked"]
-            tint, strong = self.TINT.get(kind, (None, None))
             body, k = [], 0
             while k < len(shown):
                 j = k
                 while j < len(shown) and tags[j] == tags[k] and marked[j] == marked[k]:
                     j += 1
                 tag = tags[k]
-                colour = C["blood"] if tag == "del" else CODE_COLOURS.get(tag, C["silver"])
+                colour = C["blood"] if tag == "del" else C["bronze_hi"] if tag == "who" \
+                    else CODE_COLOURS.get(tag, C["silver"])
                 if kind == "ctx":
                     colour = _mute(colour)          # unchanged: same colours, a step quieter
                 style = f"color:{colour};"
                 if tag in ("cm", "del"):
                     style += " font-style:italic;"
-                if marked[k] and strong:
-                    style += f" background-color:{strong}; border-radius:2px;"
-                body.append(f"<span style=\"{style}\">{html.escape(shown[k:j])}</span>")
+                seg = shown[k:j]
+                if tag == "who":
+                    # whose change follows: in the window's own font, at the code's indent
+                    pad = len(seg) - len(seg.lstrip(" "))
+                    body.append(seg[:pad] + f"<span style=\"{style} font-family:'{QApplication.font().family()}'; "
+                                f"font-size:{max(code_size() - 1, 8)}pt; font-weight:600;\">{html.escape(seg[pad:])}</span>")
+                else:
+                    body.append(f"<span style=\"{style}\">{html.escape(seg)}</span>")
                 k = j
             line_style = "margin:0; padding:0 10px 0 0; line-height:125%;"
             self._blocks.append(("row", n))
-            out.append(f"<p style=\"{line_style}\"><span style=\"color:{C['dim']};\">"
+            gut = C["bronze_hi"] if kind in ("add", "chg") else C["blood"] if kind == "del" else C["dim"]
+            out.append(f"<p style=\"{line_style}\"><span style=\"color:{gut};\">"
                        f"{html.escape(info['gut'])}</span>{''.join(body) or ' '}</p>")
             n += 1
         out.append("</div>")
         self._quiet = True
         self.setHtml("".join(out))
         self._quiet = False
+        self._base_fade = self._unchanged_fade() if self.fade_same else []
         if keep_scroll:
             self.horizontalScrollBar().setValue(h)
             self.verticalScrollBar().setValue(v)
@@ -14490,8 +19855,40 @@ class CodeView(QTextBrowser):
         self._apply()
 
     def _apply(self):
-        # a selection's fade wins over a brace's; the brace colours and name tints go on top
-        self.setExtraSelections((self._sel_fade or self._brace_fade) + self._word_sel + self._brace_sel)
+        # a selection's fade wins over a brace's; the brace colours and name tints go on top. In a
+        # whole file (fade_same) the lines no mod changed are greyed out the same way, so a block
+        # or a selection you pick out still comes up in full colour, as in Script decisions
+        fade = self._sel_fade or self._brace_fade or getattr(self, "_base_fade", [])
+        self.setExtraSelections(fade + self._word_sel + self._brace_sel)
+
+    def _unchanged_fade(self):
+        """Extra selections greying out every run of unchanged lines, numbers and all."""
+        doc, out, run = self.document(), [], None
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(FADE))
+
+        def close():
+            if run:
+                c = QTextCursor(doc)
+                c.setPosition(run[0])
+                c.setPosition(run[1], QTextCursor.MoveMode.KeepAnchor)
+                sel = QTextEdit.ExtraSelection()
+                sel.cursor, sel.format = c, fmt
+                out.append(sel)
+        for b, entry in enumerate(self._blocks):
+            same = entry[0] == "row" and self._info[entry[1]]["kind"] == "same"
+            if not same:
+                close()
+                run = None
+                continue
+            block = doc.findBlockByNumber(b)
+            start, end = block.position(), block.position() + block.length() - 1
+            if run is None:
+                run = [start, end]
+            else:
+                run[1] = end
+        close()
+        return out
 
     def open_fold(self, fid):
         self._open.add(fid)
@@ -14529,39 +19926,9 @@ class CodeView(QTextBrowser):
         if x is not None and not (bar.value() <= x <= bar.value() + room * 0.85):
             bar.setValue(max(0, int(x - room / 3)))
 
-    def _paint_bands(self):
-        """Each run of added (or changed) lines as one section: a light fill across the full
-        width, with a thin coloured edge on the left."""
-        lay = self.document().documentLayout()
-        top = self.verticalScrollBar().value()
-        width = self.viewport().width()
-        p = QPainter(self.viewport())
-        block = self.document().begin()
-        run_kind, run_top, run_bottom = None, 0.0, 0.0
-
-        def flush():
-            if run_kind in self.BAND:
-                fill, edge = self.BAND[run_kind]
-                p.fillRect(QRectF(0, run_top, width, run_bottom - run_top), fill)
-                p.fillRect(QRectF(0, run_top, 3, run_bottom - run_top), edge)
-        for entry in self._blocks:
-            kind = self._info[entry[1]]["kind"] if entry[0] == "row" else None
-            r = lay.blockBoundingRect(block)
-            y1, y2 = r.top() - top, r.bottom() - top
-            if kind == run_kind and kind in self.BAND:
-                run_bottom = y2
-            else:
-                flush()
-                run_kind, run_top, run_bottom = kind, y1, y2
-            block = block.next()
-        flush()
-        p.end()
-
     def paintEvent(self, e):
-        """Changed-line sections under the text, then the text, then faint indent guides: a
-        line at every indent level, so nested blocks read at a glance."""
-        if self._blocks and self._args is not None:
-            self._paint_bands()
+        """The text, then faint indent guides: a line at every indent level, so nested blocks read
+        at a glance. Nothing is painted under the code: it reads best on the plain background."""
         super().paintEvent(e)
         if not self._blocks or self._args is None:
             return
@@ -14577,7 +19944,7 @@ class CodeView(QTextBrowser):
                 levels.append(None)
                 continue
             shown = self._info[entry[1]]["shown"]
-            blank = not shown.strip() or self._info[entry[1]]["kind"] == "del"
+            blank = not shown.strip() or self._info[entry[1]]["kind"] in ("del", "who")
             levels.append((len(shown) - len(shown.lstrip(" "))) // 4 if not blank else -1)
         for i, lv in enumerate(levels):                    # blank lines carry on the guides around them
             if lv == -1:
@@ -14600,8 +19967,31 @@ class CodeView(QTextBrowser):
             block = block.next()
         p.end()
 
+    def mousePressEvent(self, e):
+        """A press always starts a new selection. Inside what's selected Qt would start dragging
+        that text away instead (nothing is selected then, which looked random)."""
+        if e.button() == Qt.MouseButton.LeftButton and self.textCursor().hasSelection() \
+                and not e.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            h, v = self.horizontalScrollBar().value(), self.verticalScrollBar().value()
+            c = self.textCursor()
+            c.clearSelection()
+            self._quiet = True
+            self.setTextCursor(c)
+            self._quiet = False
+            self.horizontalScrollBar().setValue(h)
+            self.verticalScrollBar().setValue(v)
+            self._selection_changed()
+        super().mousePressEvent(e)
+
     def mouseReleaseEvent(self, e):
         super().mouseReleaseEvent(e)
+        keep = getattr(self, "_keep_scroll", None)
+        if keep:
+            self._keep_scroll = None
+            self.horizontalScrollBar().setValue(keep[0])
+            self.verticalScrollBar().setValue(keep[1])
+            QTimer.singleShot(0, lambda: (self.horizontalScrollBar().setValue(keep[0]),
+                                          self.verticalScrollBar().setValue(keep[1])))
         if e.button() == Qt.MouseButton.LeftButton and not self.textCursor().hasSelection():
             b = self.cursorForPosition(e.position().toPoint()).blockNumber()
             if b < len(self._blocks) and self._blocks[b][0] == "fold":
@@ -14624,9 +20014,14 @@ class CodeView(QTextBrowser):
         sel = QTextCursor(self.document())
         sel.setPosition(a.selectionStart())
         sel.setPosition(z.selectionEnd(), QTextCursor.MoveMode.KeepAnchor)
+        # the view stays where it is: setting the cursor would scroll to the block's far end
+        h, v = self.horizontalScrollBar().value(), self.verticalScrollBar().value()
         self._quiet = True
         self.setTextCursor(sel)
         self._quiet = False
+        self.horizontalScrollBar().setValue(h)
+        self.verticalScrollBar().setValue(v)
+        self._keep_scroll = (h, v)                        # and after the click's release, which scrolls too
         self._show_pair(brace)
         self._selection_changed()
 
@@ -15071,8 +20466,8 @@ class ScriptResolverDialog(RememberingDialog):
         self.check_note = QLabel()
         self.check_note.setWordWrap(True)
         self.check_note.setTextFormat(Qt.TextFormat.RichText)
-        self.check_note.setStyleSheet(f"QLabel {{ color: {C['blood']}; background: rgba(214,106,94,0.10); "
-                                      "border: 1px solid rgba(214,106,94,0.35); border-radius: 6px; "
+        self.check_note.setStyleSheet(f"QLabel {{ color: {C['blood']}; background: rgba(227,115,95,0.10); "
+                                      "border: 1px solid rgba(227,115,95,0.35); border-radius: 6px; "
                                       "padding: 5px 10px; }")
         self.check_note.hide()
         self.upper_v.addWidget(self.check_note)
@@ -16100,6 +21495,387 @@ class ScriptResolverDialog(RememberingDialog):
                 for key, ans in self.answers.items() if ans}
 
 
+class ChangeMarksBar(QScrollBar):
+    """A vertical scrollbar with a small gold mark where each change is in the file, like an
+    overview of it. Clicking a mark jumps to that change (jump(index))."""
+    def __init__(self, jump, parent=None):
+        super().__init__(Qt.Orientation.Vertical, parent)
+        self._jump = jump
+        self.source = lambda: []                      # each change: (top, bottom) as a share of the file,
+                                                      # worked out when drawn (the layout is final then)
+
+    @property
+    def spans(self):
+        return self.source()
+
+    def _groove(self):
+        opt = QStyleOptionSlider()
+        self.initStyleOption(opt)
+        st = self.style()
+        return (st.subControlRect(QStyle.ComplexControl.CC_ScrollBar, opt, QStyle.SubControl.SC_ScrollBarGroove, self),
+                st.subControlRect(QStyle.ComplexControl.CC_ScrollBar, opt, QStyle.SubControl.SC_ScrollBarSlider, self))
+
+    def _marks(self):
+        g, _h = self._groove()
+        out = []
+        for a, b in self.spans:
+            y1 = g.top() + a * g.height()
+            out.append(QRectF(g.left() + 1, y1, g.width() - 2, max(3.0, (b - a) * g.height())))
+        return out
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        if not self.spans:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(C["bronze"]))
+        for r in self._marks():
+            p.drawRoundedRect(r, 1.5, 1.5)
+        p.end()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and self.spans:
+            _g, handle = self._groove()
+            y = e.position().y()
+            if not handle.contains(e.position().toPoint()):
+                near = [(abs(r.center().y() - y) if not (r.top() - 3 <= y <= r.bottom() + 3) else 0, i)
+                        for i, r in enumerate(self._marks())]
+                d, i = min(near)
+                if d <= 4:
+                    self._jump(i)
+                    return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        super().mouseMoveEvent(e)
+        if not (e.buttons() & Qt.MouseButton.LeftButton):
+            y = e.position().y()
+            on = any(r.top() - 3 <= y <= r.bottom() + 3 for r in self._marks())
+            self.setCursor(Qt.CursorShape.PointingHandCursor if on else Qt.CursorShape.ArrowCursor)
+
+
+class MergedScriptDialog(RememberingDialog):
+    """A merged script (or XML file) whole, as the game gets it: what the merge changed in full
+    colour with whose change it is, the rest greyed out. Only for looking: decisions are made in
+    Script decisions, which `decide` opens (given when the file has decisions of yours)."""
+    window_key = "merged_view"
+
+    def __init__(self, parent, view, decide=None):
+        super().__init__(parent)
+        self.setWindowTitle("Merged script" if view["lang"] == "ws" else "Merged file")
+        self.resize(1100, 780)
+        rows, self.starts = merged_rows(view["base"], view["merged"], view["versions"])
+        self.index = -1
+        v = QVBoxLayout(self)
+        v.setContentsMargins(20, 18, 20, 16)
+        v.setSpacing(14)
+        bar = QFrame(objectName="DecisionBar")
+        bar.setStyleSheet(f"QFrame#DecisionBar {{ background: {C['raised']}; border: 1px solid {C['ridge']}; "
+                          f"border-radius: 8px; }} QFrame#DecisionBar QLabel {{ background: transparent; border: 0; }}")
+        top = QHBoxLayout(bar)
+        top.setContentsMargins(18, 12, 14, 12)
+        top.setSpacing(10)
+        where = QVBoxLayout()
+        where.setSpacing(3)
+        folder, _, name = view["rel"].rpartition("/")
+        title = QLabel((f"<span style='color:{C['ash']}; font-weight:400;'>{html.escape(folder)}/</span>"
+                        if folder else "") + html.escape(name))
+        title.setTextFormat(Qt.TextFormat.RichText)
+        title.setStyleSheet("font-size: 15pt; font-weight: 600;")
+        where.addWidget(title, 0, Qt.AlignmentFlag.AlignLeft)
+        names = [l for l, _v in view["versions"]]
+        self._from_text = (f"<span style='color:{C['ash']}'>Merged from&nbsp;&nbsp;</span>"
+                           + html.escape(" · ".join(dict.fromkeys(names))))
+        self.merged_from = merged_from = QLabel(self._from_text)
+        merged_from.setTextFormat(Qt.TextFormat.RichText)
+        merged_from.setStyleSheet(f"color: {C['silver']}; font-size: 11pt;")
+        where.addWidget(merged_from)
+        # the file's name: under the mouse, the game's own copy shows instead, at the same spot
+        self._peeking = False
+        self.title = title
+        if view["base"]:
+            title.installEventFilter(self)
+        top.addLayout(where, 1)
+        self.prev_btn = QPushButton("‹ Previous")
+        self.next_btn = QPushButton("Next ›")
+        self.step = QLabel()
+        self.step.setStyleSheet(f"color: {C['ash']}; padding: 0 6px;")
+        self.prev_btn.clicked.connect(lambda: self.go(self.index - 1))
+        self.next_btn.clicked.connect(lambda: self.go(self.index + 1))
+        for w in (self.prev_btn, self.step, self.next_btn):
+            top.addWidget(w, 0, Qt.AlignmentFlag.AlignVCenter)
+        v.addWidget(bar)
+        self.view = CodeView()
+        self.view.lang = view["lang"]
+        self.view.fade_same = True
+        self.view.FOLD_MIN = 10 ** 9                      # the whole file, nothing folded
+        self.marks = ChangeMarksBar(self.go)
+        self.marks.setMouseTracking(True)
+        self.view.setVerticalScrollBar(self.marks)
+        digits = max(3, len(str(max(len(view["merged"]), len(view["base"])))))   # both line up
+        self.view.show_rows(rows, 0, digits)
+        self._ends = [next((k for k in range(nxt - 1, st, -1) if rows[k][2] != "same"), st)
+                      for st, nxt in zip(self.starts, self.starts[1:] + [len(rows)])]
+        # the game's original, ready to swap in at once
+        orows, self._orig_runs, self._both = original_rows(view["base"], view["merged"])
+        self.orig = CodeView()
+        self.orig.lang = view["lang"]
+        self.orig.fade_same = True
+        self.orig.FOLD_MIN = 10 ** 9
+        self.orig_marks = ChangeMarksBar(lambda _i: None)
+        self.orig.setVerticalScrollBar(self.orig_marks)
+        if view["base"]:
+            self.orig.show_rows(orows, 0, digits)
+        QTimer.singleShot(0, self._place_marks)
+        frame = QFrame(objectName="CodeFrame")
+        frame.setStyleSheet(f"QFrame#CodeFrame {{ background: {C['well']}; border: 1px solid "
+                            f"{C['ridge']}; border-radius: 8px; }}")
+        fl = QVBoxLayout(frame)
+        fl.setContentsMargins(4, 4, 4, 8)
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self.view)
+        self.stack.addWidget(self.orig)
+        fl.addWidget(self.stack)
+        v.addWidget(frame, 1)
+        foot = QHBoxLayout()
+        foot.setSpacing(8)
+        # the code font from Settings, to change right here (Settings shows the same)
+        self.font_box = QComboBox()
+        fonts = fixed_fonts()
+        self.font_box.addItems(fonts)
+        if code_font() in fonts:
+            self.font_box.setCurrentText(code_font())
+        self.font_box.setToolTip("Code font, as in Settings")
+        self.size_box = QSpinBox()
+        self.size_box.setRange(8, 20)
+        self.size_box.setSuffix(" pt")
+        self.size_box.setValue(int(round(code_size())))
+        self.size_box.setToolTip("Code size, as in Settings")
+        self.size_box.setFixedHeight(self.font_box.sizeHint().height())
+        self.font_box.currentTextChanged.connect(self._font_changed)
+        self.size_box.valueChanged.connect(self._font_changed)
+        foot.addWidget(self.font_box)
+        foot.addWidget(self.size_box)
+        foot.addStretch(1)
+        if decide:
+            go = QPushButton("Script decisions…")
+            go.setToolTip("Change the decisions made for this file.")
+            go.clicked.connect(lambda: (self.accept(), decide()))
+            foot.addWidget(go)
+        close = QPushButton("Close")
+        close.clicked.connect(self.accept)
+        foot.addWidget(close)
+        v.addLayout(foot)
+        self.restore_size()
+        QTimer.singleShot(0, lambda: self.go(0))
+
+    def _place_marks(self):
+        """The gold marks on the scrollbars: where each change sits in the merged file, and where
+        the merge changed the original."""
+        def spans(view, runs):
+            if not view._rows:
+                return []
+            doc = view.document()
+            lay = doc.documentLayout()
+            bar = view.verticalScrollBar()
+            total = max(1.0, float(bar.maximum() + bar.pageStep()))     # the whole file, in pixels
+            out = []
+            for st, end in runs:
+                top = lay.blockBoundingRect(doc.findBlockByNumber(view._block_of_row(st)[0])).top()
+                bot = lay.blockBoundingRect(doc.findBlockByNumber(view._block_of_row(end)[0])).bottom()
+                out.append((top / total, bot / total))
+            return out
+        self.marks.source = lambda: spans(self.view, list(zip(self.starts, self._ends)))
+        self.orig_marks.source = lambda: spans(self.orig, self._orig_runs)
+        self.marks.update()
+        self.orig_marks.update()
+
+    def eventFilter(self, obj, e):
+        if obj is self.title and e.type() in (QEvent.Type.Enter, QEvent.Type.Leave):
+            self.show_original(e.type() == QEvent.Type.Enter)
+        return super().eventFilter(obj, e)
+
+    def _row_rect(self, view, row):
+        b, _fid = view._block_of_row(row)
+        return view.document().documentLayout().blockBoundingRect(view.document().findBlockByNumber(b))
+
+    def show_original(self, on):
+        """The game's own copy in place of the merged one (on), or back. The code in the middle of
+        the view stays where it is on screen: for a line only the merged file has, the nearest
+        line above it that both have."""
+        if on == self._peeking or (on and not self.orig._rows):
+            return
+        self._peeking = on
+        if on:
+            mv = self.view
+            mid = mv.viewport().height() // 2
+            b = mv.cursorForPosition(QPoint(0, mid)).blockNumber()
+            entry = mv._blocks[b] if 0 <= b < len(mv._blocks) else ("row", 0)
+            row = entry[1] if entry[0] == "row" else entry[2]
+            anchor = None
+            for k in list(range(row, -1, -1)) + list(range(row + 1, len(mv._rows))):
+                num = mv._rows[k][0]
+                if num != "" and (num - 1) in self._both:
+                    anchor = (k, self._both[num - 1])
+                    break
+            self.stack.setCurrentWidget(self.orig)          # shown first: its scroll range is set then
+            if anchor is not None:
+                on_screen = self._row_rect(mv, anchor[0]).top() - mv.verticalScrollBar().value()
+                target = self._row_rect(self.orig, anchor[1]).top() - on_screen
+                self.orig.verticalScrollBar().setValue(max(0, int(round(target))))
+            self.orig.horizontalScrollBar().setValue(mv.horizontalScrollBar().value())
+            self.merged_from.setText(f"<span style='color:{C['bronze_hi']}'>The game's original</span>")
+            self.step.setStyleSheet(f"color: {C['dim']}; padding: 0 6px;")
+        else:
+            self.stack.setCurrentWidget(self.view)
+            self.merged_from.setText(self._from_text)
+            self.step.setStyleSheet(f"color: {C['ash']}; padding: 0 6px;")
+
+    def _font_changed(self, *_):
+        """Saved as your code font at once (the same setting as in Settings), and shown here."""
+        global _code_font
+        cfg = getattr(self.parent(), "cfg", None)
+        cfg = cfg if isinstance(cfg, dict) else load_config()
+        cfg["code_font"], cfg["code_size"] = self.font_box.currentText(), self.size_box.value()
+        save_config(cfg)
+        _code_font = None
+        # the line in the middle of the view stays in the middle: the text grows or shrinks around it
+        view = self.view
+        mid = view.viewport().height() // 2
+        b = view.cursorForPosition(QPoint(0, mid)).blockNumber()
+        entry = view._blocks[b] if 0 <= b < len(view._blocks) else None
+        row = entry[1] if entry and entry[0] == "row" else None
+        view.rerender()
+        if row is not None:
+            nb, _fid = view._block_of_row(row)
+            block = view.document().findBlockByNumber(nb)
+            r = view.document().documentLayout().blockBoundingRect(block)
+            view.verticalScrollBar().setValue(max(0, int(r.top() + r.height() / 2 - mid)))
+        if self.orig._rows:
+            self.orig.rerender()
+        self._place_marks()
+
+    def go(self, index):
+        """Scroll to a change, a few lines from the top, and say which one it is."""
+        if not self.starts:
+            self.step.setText("No changes")
+            self.prev_btn.setEnabled(False)
+            self.next_btn.setEnabled(False)
+            return
+        self.index = max(0, min(index, len(self.starts) - 1))
+        b, _fid = self.view._block_of_row(self.starts[self.index])
+        block = self.view.document().findBlockByNumber(b)
+        y = self.view.document().documentLayout().blockBoundingRect(block).top()
+        line = self.view.document().documentLayout().blockBoundingRect(block).height()
+        self.view.verticalScrollBar().setValue(max(0, int(y - 4 * line)))
+        self.view.horizontalScrollBar().setValue(0)
+        self.step.setText(f"Change {self.index + 1} of {len(self.starts)}")
+        self.prev_btn.setEnabled(self.index > 0)
+        self.next_btn.setEnabled(self.index < len(self.starts) - 1)
+
+
+class BlobScriptDialog(RememberingDialog):
+    """A mod's precompiled scripts (precompiled.rsblob), decompiled back to WitcherScript, to read:
+    what it does to a function where its version is the one used."""
+    window_key = "blob_view"
+
+    def __init__(self, parent, source, at=None):
+        super().__init__(parent)
+        text, self.where, name = source
+        self.setWindowTitle("Precompiled scripts")
+        self.resize(1100, 780)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(20, 18, 20, 16)
+        v.setSpacing(14)
+        bar = QFrame(objectName="DecisionBar")
+        bar.setStyleSheet(f"QFrame#DecisionBar {{ background: {C['raised']}; border: 1px solid {C['ridge']}; "
+                          f"border-radius: 8px; }} QFrame#DecisionBar QLabel {{ background: transparent; border: 0; }}")
+        top = QVBoxLayout(bar)
+        top.setContentsMargins(18, 12, 14, 12)
+        top.setSpacing(3)
+        title = QLabel(html.escape(name))
+        title.setStyleSheet("font-size: 15pt; font-weight: 600;")
+        top.addWidget(title)
+        sub = QLabel(f"<span style='color:{C['ash']}'>Precompiled scripts, decompiled. Comments and formatting "
+                     "aren't kept in them.</span>")
+        sub.setTextFormat(Qt.TextFormat.RichText)
+        sub.setStyleSheet("font-size: 11pt;")
+        top.addWidget(sub)
+        v.addWidget(bar)
+        lines = text.split("\n")
+        if lines and not lines[-1]:
+            lines.pop()
+        self.view = CodeView()
+        self.view.FOLD_MIN = 10 ** 9
+        self.view.show_rows([(k + 1, l, "same", ()) for k, l in enumerate(lines)], 0, max(3, len(str(len(lines)))))
+        frame = QFrame(objectName="CodeFrame")
+        frame.setStyleSheet(f"QFrame#CodeFrame {{ background: {C['well']}; border: 1px solid "
+                            f"{C['ridge']}; border-radius: 8px; }}")
+        fl = QVBoxLayout(frame)
+        fl.setContentsMargins(4, 4, 4, 8)
+        fl.addWidget(self.view)
+        v.addWidget(frame, 1)
+        foot = QHBoxLayout()
+        foot.setSpacing(8)
+        self.font_box = QComboBox()
+        fonts = fixed_fonts()
+        self.font_box.addItems(fonts)
+        if code_font() in fonts:
+            self.font_box.setCurrentText(code_font())
+        self.font_box.setToolTip("Code font, as in Settings")
+        self.size_box = QSpinBox()
+        self.size_box.setRange(8, 20)
+        self.size_box.setSuffix(" pt")
+        self.size_box.setValue(int(round(code_size())))
+        self.size_box.setToolTip("Code size, as in Settings")
+        self.size_box.setFixedHeight(self.font_box.sizeHint().height())
+        self.font_box.currentTextChanged.connect(self._font_changed)
+        self.size_box.valueChanged.connect(self._font_changed)
+        foot.addWidget(self.font_box)
+        foot.addWidget(self.size_box)
+        foot.addStretch(1)
+        close = QPushButton("Close")
+        close.clicked.connect(self.accept)
+        foot.addWidget(close)
+        v.addLayout(foot)
+        self.restore_size()
+        if at:
+            QTimer.singleShot(0, lambda: self.go_to(*at))
+
+    def go_to(self, cls, fn):
+        """Scroll to a function, a few lines from the top: one of a class's, or one this mod adds or
+        wraps on a class, or a global one."""
+        line = self.where.get((cls.lower(), fn.lower())) or self.where.get(("", fn.lower()))
+        if not line:
+            line = next((l for (c, f), l in self.where.items() if f == fn.lower()), None)
+        if not line:
+            return
+        b, _fid = self.view._block_of_row(line - 1)
+        block = self.view.document().findBlockByNumber(b)
+        r = self.view.document().documentLayout().blockBoundingRect(block)
+        self.view.verticalScrollBar().setValue(max(0, int(r.top() - 3 * r.height())))
+
+    def _font_changed(self, *_):
+        global _code_font
+        cfg = getattr(self.parent(), "cfg", None)
+        cfg = cfg if isinstance(cfg, dict) else load_config()
+        cfg["code_font"], cfg["code_size"] = self.font_box.currentText(), self.size_box.value()
+        save_config(cfg)
+        _code_font = None
+        view = self.view
+        mid = view.viewport().height() // 2
+        b = view.cursorForPosition(QPoint(0, mid)).blockNumber()
+        entry = view._blocks[b] if 0 <= b < len(view._blocks) else None
+        row = entry[1] if entry and entry[0] == "row" else None
+        view.rerender()
+        if row is not None:
+            nb, _fid = view._block_of_row(row)
+            r = view.document().documentLayout().blockBoundingRect(view.document().findBlockByNumber(nb))
+            view.verticalScrollBar().setValue(max(0, int(r.top() + r.height() / 2 - mid)))
+
+
 class MergerPathsDialog(RememberingDialog):
     """Script Merger's saved paths are wrong for this prefix — show what changes."""
     window_key = "merger_paths"
@@ -16299,6 +22075,1058 @@ class ListFit:
             save_window_state(self._fit_key, QByteArray(str(int(self._hand_h)).encode()))
 
 
+MENU_OFF_WORDS = {"off", "no", "false", "disabled", "disable"}
+MENU_ON_WORDS = {"on", "yes", "true", "enabled", "enable"}
+
+
+def menu_switch_pair(labels):
+    """A list of two choices that's really a switch ("OFF" / "ON", "No" / "Yes", "Disabled" /
+    "Enabled", either way round): (the off choice's position, the on choice's), else None."""
+    if len(labels) != 2:
+        return None
+    words = [re.sub(r"[^a-z]", "", (lab or "").lower()) for lab in labels]
+    off = [i for i, w in enumerate(words) if w in MENU_OFF_WORDS]
+    on = [i for i, w in enumerate(words) if w in MENU_ON_WORDS]
+    return (off[0], on[0]) if len(off) == 1 and len(on) == 1 else None
+
+
+MENU_NUMBER_CHOICE = re.compile(r"^\s*([-+]?\d+(?:[.,]\d+)?)\s*(%|x|s|m|°)?\s*(\(.*\))?\s*$", re.I)
+MENU_LIST_SLIDER_MIN = 8
+
+
+def menu_number_list(labels):
+    """A list of choices that's really a scale ("0", "0.1" … "1.0 (Default)" … "2.0"): [(the
+    number as shown, a note or "")] when there are at least MENU_LIST_SLIDER_MIN choices, each a
+    number (with a unit like % or x, and a note in brackets at most), going up or down all the
+    way. None otherwise: words ("Low", "High") stay a dropdown."""
+    if len(labels) < MENU_LIST_SLIDER_MIN:
+        return None
+    out, nums = [], []
+    for lab in labels:
+        m = MENU_NUMBER_CHOICE.match(lab or "")
+        if not m:
+            return None
+        nums.append(float(m.group(1).replace(",", ".")))
+        out.append((m.group(1) + (m.group(2) or ""), (m.group(3) or "").strip()))
+    pairs = list(zip(nums, nums[1:]))
+    if not (all(a < b for a, b in pairs) or all(a > b for a, b in pairs)):
+        return None
+    return out
+
+
+class MarkedSlider(QSlider):
+    """A slider for a list of choices that's a scale: a small tick under the track at each choice
+    the mod notes ("1.0 (Default)"). The mouse wheel is the page's until it's clicked, as for the
+    other sliders."""
+
+    def __init__(self, marks=()):
+        super().__init__(Qt.Orientation.Horizontal)
+        self.marks = list(marks)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, e):
+        if self.hasFocus():
+            super().wheelEvent(e)
+        else:
+            e.ignore()
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        if not self.marks or self.maximum() <= self.minimum():
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        handle = 14                                  # the handle's width (QSlider#MenuSlider)
+        span = self.width() - handle
+        cy = self.height() / 2
+        for i in self.marks:
+            x = handle / 2 + span * (i - self.minimum()) / (self.maximum() - self.minimum())
+            on = i <= self.value()
+            p.setBrush(QColor(C["bronze"] if on else C["ridge_hi"]))
+            p.drawRoundedRect(QRectF(x - 1, cy + 5, 2, 5), 1, 1)
+
+
+def menu_value_text(v):
+    """A slider's value as the game writes it: no trailing zeros (6, 0.5, 0.25)."""
+    t = f"{v:.4f}".rstrip("0").rstrip(".")
+    return "0" if t in ("-0", "") else t
+
+
+class QuietWheelSlider(QSlider):
+    """A slider that leaves the mouse wheel to the page it's on until it's clicked, so scrolling
+    past it never changes a setting."""
+
+    def __init__(self, *a):
+        super().__init__(*a)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, e):
+        if self.hasFocus():
+            super().wheelEvent(e)
+        else:
+            e.ignore()
+
+
+class QuietWheelCombo(QComboBox):
+    """The same for a dropdown. Its list is a plain list view, so the window's style reaches
+    each entry (Qt's own list for a dropdown ignores it)."""
+
+    def __init__(self, *a):
+        super().__init__(*a)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setView(QListView())
+        # its open list gets the soft shadow the menus and tooltips have: a see-through margin
+        # around the list, the shadow painted into it
+        box = self.view().parentWidget()
+        box.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        box.setWindowFlags(box.windowFlags() | Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint)
+        box.setObjectName("MenuComboPopup")
+        box.setStyleSheet("QFrame#MenuComboPopup { background: transparent; border: 0; }")   # only the frame, not the list
+        box.installEventFilter(self)
+
+    def showPopup(self):
+        # its list drops under the field (combobox-popup: 0 in the window style), not over it with the
+        # chosen entry on the field: that kind scrolls by arrows at its ends, and on Wayland, where the
+        # list's new size (with the shadow's margin) arrives a moment late, an arrow stayed on and cut
+        # off the last entry (Remos, 30 Oct)
+        box = self.view().parentWidget()
+        # Qt turned the list's scrollbar off when the view was set, before the window style said
+        # the list drops under the field: a long list then had no scrollbar (Remos, 30 Oct)
+        self.view().setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        lay = box.layout()
+        if lay:
+            lay.setContentsMargins(0, 0, 0, 0)                # Qt sizes and places the list itself first
+        super().showPopup()
+        side, top, bottom = MENU_SHADOW
+        g = box.geometry()
+        # Qt leaves the list's own padding out of its height, so the last entry was cut off: tall
+        # enough for its entries (up to the usual most, then it scrolls)
+        v = self.view()
+        if lay:
+            lay.activate()
+        rows = [i for i in range(self.count()) if not v.isRowHidden(i)][:self.maxVisibleItems()]
+        # wide enough for its longest choice, never cut short (Remos, 30 Oct): it grows to the left,
+        # its right edge staying at the field's
+        frame = v.width() - v.viewport().width()
+        bar = v.verticalScrollBar().sizeHint().width() if self.count() > len(rows) else 0
+        need = v.sizeHintForColumn(0) + frame + bar + 8
+        widen = max(0, need - g.width())
+        grow = max(0, sum(v.sizeHintForRow(i) for i in rows) + v.height() - v.viewport().height() - v.height())
+        above = g.bottom() <= self.mapToGlobal(QPoint(0, 0)).y()     # Qt opened it above the field: it grows up
+        if lay:
+            lay.setContentsMargins(side, top, side, bottom)
+        # then the margin goes around it, so the list stays where Qt put it
+        screen = (self.screen() or QGuiApplication.primaryScreen()).availableGeometry()
+        left = max(screen.left(), g.x() - widen)
+        box.setGeometry(left - side, g.y() - top - (grow if above else 0),
+                        g.right() - left + 1 + 2 * side, g.height() + grow + top + bottom)
+
+    def eventFilter(self, obj, e):
+        if e.type() == QEvent.Type.Paint and obj is self.view().parentWidget():
+            side, top, bottom = MENU_SHADOW
+            p = QPainter(obj)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            box = QRectF(side, top, obj.width() - 2 * side, obj.height() - top - bottom)
+            reach, drop = bottom - 3, 3
+            for i in range(reach, 0, -1):
+                path = QPainterPath()
+                path.addRoundedRect(box.adjusted(-i, -i + drop, i, i + drop), i, i)
+                p.fillPath(path, QColor(0, 0, 0, int(64 * (1 - i / reach) ** 2 + 2)))
+            p.end()
+        return super().eventFilter(obj, e)
+
+    def wheelEvent(self, e):
+        if self.hasFocus():
+            super().wheelEvent(e)
+        else:
+            e.ignore()
+
+
+class MenuRule(QFrame):
+    """The divider between two settings in a card: one screen pixel thick wherever it falls. A
+    styled 1-pixel line came out one or two pixels thick on a scaled display (125 %, 150 %),
+    depending on where it landed (Remos, 30 Oct). inset: it starts where a sub-setting's name does."""
+
+    def __init__(self, inset=False):
+        super().__init__(objectName="MenuRule")
+        self.setFixedHeight(2)                      # room for the line however the scale rounds its place
+        self.setProperty("inset", bool(inset))
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        line = QColor(C["ridge"])
+        line.setAlphaF(0.85)                        # 15 % see-through: a touch quieter (Remos, 30 Oct)
+        pen = QPen(line)
+        pen.setCosmetic(True)                       # one device pixel, whatever the scale
+        pen.setWidth(0)
+        p.setPen(pen)
+        left = 50 if self.property("inset") else 14
+        p.drawLine(QPointF(left, 1), QPointF(self.width() - 15, 1))
+        if self.property("inset"):                  # above a sub-setting: its tree line runs on through
+            tree = QPen(QColor(C["ridge_hi"]), 1.5)
+            tree.setCapStyle(Qt.PenCapStyle.FlatCap)
+            p.setPen(tree)                          # not smoothed: no faint seam where it meets the row's
+            x = MenuRow.BRANCH_X + 0.5
+            p.drawLine(QPointF(x, 0), QPointF(x, self.height()))
+
+
+class MenuRow(QFrame):
+    """A setting's row in a mod's settings window, with the gold dot in front of it while you've
+    changed it, painted by the row itself: no small widget of its own sits there, since one left a
+    dark square on the hovered row on Remos's desktop (30 Oct), styled or painted."""
+    DOT_X, DOT = 14, 6                              # the row's left margin; the dot's size
+
+    BRANCH_X = 38                                   # under the start of a setting's name: its sub-settings' line
+
+    def __init__(self):
+        super().__init__(objectName="MenuRow")
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover)
+        self.setProperty("on", False)
+        self.indent = self.prev_indent = self.next_indent = False
+
+    def set_on(self, on):
+        if bool(self.property("on")) != bool(on):
+            self.setProperty("on", bool(on))
+            self.update()
+
+    def paintEvent(self, e):
+        super().paintEvent(e)                       # its background, lighter while hovered
+        if self.indent or self.next_indent:
+            # a sub-setting (tagged indent): a tree line from under its main setting's name (Remos,
+            # 30 Oct: style 1), in a quiet grey a step lighter than the dividers (bronze was too loud)
+            p = QPainter(self)                      # not smoothed: no faint seam where rows and dividers meet
+            pen = QPen(QColor(C["ridge_hi"]), 1.5)
+            pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+            p.setPen(pen)
+            x, cy, h = self.BRANCH_X + 0.5, self.height() / 2, float(self.height())
+            if self.indent:
+                p.drawLine(QPointF(x, 0), QPointF(x, h if self.next_indent else cy))
+                p.drawLine(QPointF(x, cy), QPointF(x + 8, cy))
+            else:                                   # the setting they belong to: the line starts under its name
+                p.drawLine(QPointF(x, cy + 10), QPointF(x, h))
+            p.end()
+        if not self.property("on"):
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(C["bronze"]))
+        p.drawEllipse(QRectF(self.DOT_X, (self.height() - self.DOT) / 2, self.DOT, self.DOT))
+
+
+class ToggleSwitch(QAbstractButton):
+    """An on/off switch: a rounded track, bronze when on, with a knob that sits at its end."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedSize(40, 22)
+
+    def sizeHint(self):
+        return QSize(40, 22)
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        on, hover = self.isChecked(), self.underMouse()
+        track = QColor(C["bronze_hi"] if on and hover else C["bronze"] if on else C["ridge_hi"] if hover else C["ridge"])
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(track)
+        p.drawRoundedRect(QRectF(0, 1, 40, 20), 10, 10)
+        p.setBrush(QColor(C["stone"] if on else C["silver"]))
+        p.drawEllipse(QRectF(22 if on else 3, 4, 14, 14))
+        if self.hasFocus():
+            p.setPen(QPen(QColor(C["bronze_hi"]), 1))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(QRectF(0.5, 1.5, 39, 19), 9.5, 9.5)
+
+
+class MenuPageDelegate(QStyledItemDelegate):
+    """A page in the mod settings window's list: a gold dot at its right end while it has changes."""
+    CHANGED = Qt.ItemDataRole.UserRole + 1
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        if index.data(self.CHANGED):
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(C["bronze"]))
+            r = option.rect
+            painter.drawEllipse(QRectF(r.right() - 16, r.center().y() - 3, 6, 6))
+            painter.restore()
+
+
+class MenuSettingsDialog(RememberingDialog):
+    """A mod's in-game menu, in the app: its pages on the left, each page's presets on top, its
+    settings in the middle with their value and control on the right, as the game lays them out.
+    It opens on the values the game has now (the settings file the game reads; for a mod whose
+    menu is out of the game, what the app keeps for it), the menu's defaults where there are none.
+    Labels and descriptions come from the mod's own strings, in the game's language. Presets and
+    choices set every value they list, in whichever section they name. Save writes what changed
+    into user.settings and dx12user.settings, as the game's menu would (never while the game runs)."""
+    window_key = "menu_settings"
+
+    def __init__(self, parent, mgr, mid):
+        super().__init__(parent)
+        self.mgr, self.mid = mgr, mid
+        m = mgr.get(mid)
+        self.model = mgr.menu_model(mid) or {"pages": [], "strings": {}, "values": {}, "kept": set(), "file": None}
+        # a setting the game shows only while a script turns its condition on, when that script has
+        # it off (Rational UI's Tawny Owl formula with Brothers In Arms installed): left out, its
+        # value kept; a page left with nothing to show goes too, as in the game
+        conds = self.model.get("conditions") or {}
+        for page in self.model["pages"]:
+            for it in page["items"]:
+                if it.get("condition") and conds.get(it["condition"].lower()) is False:
+                    it["hidden"] = True
+        self.model["pages"] = [p for p in self.model["pages"]
+                               if any(it["kind"] != "SEPARATOR" and not it.get("hidden") for it in p["items"])]
+        st = self.model["strings"]
+        self.setWindowTitle(f"{m['name']} settings")
+        self.names, self.start, self.defaults = {}, {}, {}
+        for page in self.model["pages"]:
+            for it in page["items"]:
+                if it["kind"] == "SEPARATOR":
+                    continue
+                k = menu_item_key(page, it)
+                self.names.setdefault(k, (it.get("section") or page["group"], it["id"]))
+                if it["kind"] != "OPTIONS" or it.get("default") not in (None, ""):
+                    self.defaults.setdefault(k, it.get("default"))
+                for o in it.get("options") or []:
+                    for sec, key, _v in o["entries"]:
+                        self.names.setdefault((sec.lower(), key.lower()), (sec, key))
+            for pr in page["presets"]:
+                for sec, key, _v in pr["entries"]:
+                    self.names.setdefault((sec.lower(), key.lower()), (sec, key))
+        for k in self.names:
+            got = self.model["values"].get(k)
+            self.start[k] = got if got is not None else self.defaults.get(k)
+        self.cur = dict(self.start)
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(22, 18, 22, 16)
+        v.setSpacing(12)
+        head = QHBoxLayout()
+        head.addWidget(QLabel(f"{m['name']}", objectName="DialogTitle"))
+        head.addStretch(1)
+        self.state_note = QLabel("", objectName="Muted")
+        head.addWidget(self.state_note)
+        v.addLayout(head)
+        body = QHBoxLayout()
+        body.setSpacing(14)
+        self.pages = QListWidget(objectName="MenuPages")
+        self.pages.setItemDelegate(MenuPageDelegate(self.pages))
+        self.pages.setFrameShape(QFrame.Shape.NoFrame)
+        self.pages.setWordWrap(True)                 # a long name (German, say) wraps, never cut or scrolled
+        self.pages.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.pages.setTextElideMode(Qt.TextElideMode.ElideNone)
+        body.addWidget(self.pages)
+        right = QVBoxLayout()
+        right.setSpacing(10)
+        self.preset_row = QHBoxLayout()
+        self.preset_row.setSpacing(6)
+        right.addLayout(self.preset_row)
+        self.stack = QStackedWidget()
+        right.addWidget(self.stack, 1)
+        body.addLayout(right, 1)
+        v.addLayout(body, 1)
+        # a setting's description, while the pointer is on it: the card's place is kept (nothing
+        # jumps), but it only shows when there's a description to read; a mod with none has no card
+        self.info_box = info_box = QFrame(objectName="MenuInfo")
+        ib = QHBoxLayout(info_box)
+        ib.setContentsMargins(12, 9, 12, 9)
+        ib.setSpacing(10)
+        self.info_mark = mark = QLabel("i", objectName="MenuInfoMark")
+        mark.setFixedSize(18, 18)
+        mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ib.addWidget(mark, 0, Qt.AlignmentFlag.AlignTop)
+        self.info = QLabel("", objectName="MenuInfoText")
+        self.info.setWordWrap(True)
+        self.info.setMinimumHeight(self.info.fontMetrics().lineSpacing() * 2)
+        self.info.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        ib.addWidget(self.info, 1)
+        v.addWidget(info_box)
+        bb = QHBoxLayout()
+        # its page in the game's own menu: shown, or left out (its settings kept, changed here)
+        self.hidden_at_start = bool(m.get("menu_hidden"))
+        self.hide_switch = ToggleSwitch()
+        self.hide_switch.setChecked(self.hidden_at_start)
+        hide_label = QLabel("Hide the Menu in-game", objectName="Muted")
+        hide_tip = ("Hides this mod's menu entry in-game. Its settings remain active and retain their current "
+                    "values, which you can still change here.")
+        for w in (self.hide_switch, hide_label):
+            w.setToolTip(hide_tip)
+        hide_label.mousePressEvent = lambda e: self.hide_switch.toggle() if e.button() == Qt.MouseButton.LeftButton else None
+        self.hide_switch.toggled.connect(lambda _on: self._sync())
+        bb.addWidget(self.hide_switch)
+        bb.addSpacing(8)
+        bb.addWidget(hide_label)
+        bb.addSpacing(24)
+        # the mod's own values for the page: a quiet link, only where no preset of the mod's sets them
+        self.defaults_link = QPushButton("Reset page to mod defaults", objectName="QuietLink")
+        self.defaults_link.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.defaults_link.setToolTip("This page's settings back to the values the mod gives them when you first install it.")
+        self.defaults_link.clicked.connect(self._page_defaults)
+        self.defaults_link.hide()
+        bb.addWidget(self.defaults_link)
+        bb.addStretch(1)
+        self.note = QLabel("", objectName="Muted")
+        bb.addWidget(self.note)
+        # Save and Cancel in the same order as the app's other windows (the desktop's own order)
+        box = QDialogButtonBox()
+        self.save_btn = box.addButton("Save", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.save_btn.setObjectName("Primary")
+        box.addButton(QDialogButtonBox.StandardButton.Cancel)
+        box.accepted.connect(self._save)
+        box.rejected.connect(self.reject)
+        bb.addWidget(box)
+        v.addLayout(bb)
+
+        self.rows = []                     # (page group, item, control, value label, label)
+        self.dots = {}                     # (section lower, key lower): the row's changed dot
+        self.preset_btns = []              # (preset, its button) on the page shown
+        for page in self.model["pages"]:
+            tags = page.get("tags") or ()
+            title = menu_label(st, "page", page["path"][-1], tags) if page["path"] else page["group"]
+            self.pages.addItem(title)
+            self.pages.item(self.pages.count() - 1).setToolTip(title)
+            self.stack.addWidget(self._page_widget(page))
+        fm = self.pages.fontMetrics()           # as wide as the longest name, within reason
+        widest = max((fm.horizontalAdvance(self.pages.item(k).text()) for k in range(self.pages.count())), default=0)
+        self.pages.setFixedWidth(max(200, min(320, widest + 64)))      # its padding, the bar, the dot
+        self.pages.currentRowChanged.connect(self._show_page)
+        self.info_box.setVisible(any(row[2].property("menu_tip") for row in self.rows)
+                                 or bool(self.model.get("descriptions", {}).get("pages")))
+        self._describe("")
+        if self.pages.count():
+            self.pages.setCurrentRow(0)
+        self._fit_values()
+        self._fit_lists()
+        self._sync()
+        self.resize(1080, 720)
+        self.restore_size()
+
+    # --- values
+    def key(self, page, item):
+        return menu_item_key(page, item)
+
+    def option_index(self, page, item, values):
+        """The choice a list shows for these values: the first whose values all match, else the
+        list's own value as a position, else the first (as the game)."""
+        for i, o in enumerate(item["options"]):
+            if o["entries"] and all(values.get((sec.lower(), key.lower())) is not None
+                                    and menu_same(values[(sec.lower(), key.lower())], val) for sec, key, val in o["entries"]):
+                return i
+        own = values.get(self.key(page, item))
+        try:
+            i = int(float(own))
+            if 0 <= i < len(item["options"]) and not any(o["entries"] for o in item["options"]):
+                return i
+        except (TypeError, ValueError):
+            pass
+        return 0
+
+    def choose(self, page, item, i):
+        """A choice picked: every value it lists set; a choice that lists none is kept by its position."""
+        o = item["options"][i]
+        if o["entries"]:
+            for sec, key, val in o["entries"]:
+                self.cur[(sec.lower(), key.lower())] = val
+        else:
+            self.cur[self.key(page, item)] = str(i)
+
+    def changes(self):
+        """{(section, key): value} that differ from what the game has now."""
+        return {self.names[k]: val for k, val in self.cur.items()
+                if val is not None and not menu_same(val, self.start.get(k))}
+
+    # --- building
+    def _page_widget(self, page):
+        """A page's settings: under each section heading a card of rows, each row its name, a dot
+        while changed, its value (sliders) and its control."""
+        st = self.model["strings"]
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.Shape.NoFrame)
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)   # rows fit the width instead
+        # the scrollbar's room is always kept (drawn only when the page scrolls), so the cards and
+        # their switches sit in the same place on every page, long or short
+        area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        vbar = area.verticalScrollBar()
+
+        def idle(_lo, hi, bar=vbar):
+            if bar.property("idle") != (hi == 0):
+                bar.setProperty("idle", hi == 0)
+                bar.style().unpolish(bar)
+                bar.style().polish(bar)
+        vbar.rangeChanged.connect(idle)
+        idle(0, 0)
+        holder = QWidget(objectName="MenuRows")
+        outer = QVBoxLayout(holder)
+        outer.setContentsMargins(0, 0, 10, 0)
+        outer.setSpacing(0)
+        box = None
+        n = 0
+        prev_row = None                    # the row above in the same card (sub-settings join up with it)
+
+        def new_box():
+            frame = QFrame(objectName="MenuCard")
+            lay = QVBoxLayout(frame)
+            lay.setContentsMargins(0, 2, 0, 2)
+            lay.setSpacing(0)
+            outer.addWidget(frame)
+            return lay
+        for item in page["items"]:
+            if item.get("hidden"):
+                continue
+            label_text = menu_label(st, "item", item["name"], item.get("tags") or ())
+            if item["kind"] == "SEPARATOR":
+                # a heading with no text anywhere stays a gap, never its raw key
+                head = menu_label_found(st, "item", item["name"], item.get("tags") or ()) or ""
+                if head:
+                    sep = QLabel(head.upper(), objectName="MenuSeparator")
+                    sep.setContentsMargins(4, 18 if outer.count() else 2, 0, 7)
+                    outer.addWidget(sep)
+                elif outer.count():
+                    outer.addSpacing(12)                 # no heading: just the next card, a short gap away
+                box, n, prev_row = None, 0, None
+                continue
+            if box is None:
+                box = new_box()
+            indented = "indent" in {t.lower() for t in item.get("tags") or ()}
+            if n:
+                box.addWidget(MenuRule(inset=indented))  # above a sub-setting: the line starts at its name
+            row = dot = MenuRow()                        # the row paints its own changed dot
+            row.indent = indented
+            if n and prev_row is not None:
+                row.prev_indent = prev_row.indent
+                if indented:
+                    prev_row.next_indent = True
+            prev_row = row
+            h = QHBoxLayout(row)
+            h.setContentsMargins(14, 0, 14, 0)
+            h.setSpacing(12)
+            row.setMinimumHeight(44)
+            label = QLabel(label_text, objectName="MenuLabel")
+            label.setWordWrap(True)                      # a long name wraps rather than pushing the row wider
+            label.setMinimumWidth(120)
+            value = QLabel("", objectName="MenuValue")
+            value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            value.setFixedSize(62, 26)
+            control = self._control(page, item)
+            tip = self.model.get("descriptions", {}).get("items", {}).get(self.key(page, item)) or menu_item_tip(st, page, item)
+            raw_pictures = bool(re.search(r"<\s*img\b", tip or "", re.I))   # as the mod wrote it, pictures found or not
+            tip = menu_rich(tip, self.mgr.menu_image)
+            # a description with pictures (Rational Inventory Icons' icon rows) is a tooltip on the setting,
+            # not in the card (Remos, 30 Oct: "I liked it better"); one in words shows in the card under the
+            # pointer, as the game does, not as a tooltip too. A mod whose descriptions are all pictures
+            # has no card
+            pictures = raw_pictures
+            for w in (row, label, control, value):
+                w.installEventFilter(self)
+                w.setProperty("menu_tip", "" if pictures else tip)
+                w.setToolTip(tip if pictures else "")
+            h.addSpacing(MenuRow.DOT + h.spacing())      # the dot's place and its gap: the row paints it there
+            if indented:
+                h.addSpacing(18)                         # a setting under the one above it, as the game indents it
+            h.addWidget(label)
+            if item["kind"] == "SLIDER" or self.scale_of(page, item):
+                h.addWidget(value, 0, Qt.AlignmentFlag.AlignVCenter)
+            else:
+                value.hide()
+            slot = QWidget()
+            sl = QHBoxLayout(slot)
+            sl.setContentsMargins(0, 0, 0, 0)
+            sl.addWidget(control)
+            if item["kind"] == "SLIDER" or self.scale_of(page, item) or not isinstance(control, (ToggleSwitch, QComboBox)):
+                slot.setMinimumWidth(220)                # a slider: 300 when there's room, down to 220 when there isn't
+                slot.setMaximumWidth(300)
+                slot.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            else:
+                # a switch or a dropdown takes only its own width, so the name has the rest of the row and
+                # wraps only when it truly runs out of room (Remos, 30 Oct: it wrapped with half the row free)
+                slot.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+            label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            h.addWidget(slot)
+            box.addWidget(row)
+            self.rows.append((page, item, control, value, label))
+            self.dots[self.key(page, item)] = dot
+            n += 1
+        outer.addStretch(1)
+        area.setWidget(holder)
+        return area
+
+    def _control(self, page, item):
+        k = self.key(page, item)
+        kind = item["kind"]
+        if kind == "TOGGLE":
+            box = ToggleSwitch()
+            box.toggled.connect(lambda on: self._set(k, "true" if on else "false"))
+            return box
+        if kind == "SLIDER":
+            sl = QuietWheelSlider(Qt.Orientation.Horizontal)
+            sl.setObjectName("MenuSlider")
+            sl.setRange(0, item["steps"])
+            step = (item["max"] - item["min"]) / item["steps"]
+            sl.valueChanged.connect(lambda i: self._set(k, menu_value_text(item["min"] + i * step)))
+            return sl
+        pair = self.switch_of(page, item)
+        if pair:
+            # a list of two that's really a switch (OFF / ON): a switch, like the menu's own switches
+            box = ToggleSwitch()
+            box.toggled.connect(lambda on: (self.choose(page, item, pair[1] if on else pair[0]), self._sync()))
+            return box
+        scale = self.scale_of(page, item)
+        if kind == "OPTIONS" and scale:
+            # a list that's a scale (0, 0.1 … 2.0): a slider over its choices, the choice in the box
+            sl = MarkedSlider([i for i, (_n, note) in enumerate(scale) if note])
+            sl.setObjectName("MenuSlider")
+            sl.setRange(0, len(scale) - 1)
+            sl.setPageStep(1)
+            sl.valueChanged.connect(lambda i: (self.choose(page, item, i), self._sync()))
+            return sl
+        if kind == "OPTIONS":
+            combo = QuietWheelCombo()
+            combo.setObjectName("MenuCombo")
+            combo.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)   # its width: _fit_lists
+            combo.setFixedHeight(26)               # as tall as a slider's value box: every row looks the same weight
+            for o in item["options"]:
+                combo.addItem(menu_label(self.model["strings"], "choice", o["name"], item.get("tags") or ()))
+            combo.currentIndexChanged.connect(lambda i: (self.choose(page, item, i), self._sync()) if i >= 0 else None)
+            return combo
+        edit = QLineEdit()                 # a kind of setting the app doesn't know: its value as text
+        edit.textEdited.connect(lambda t: self._set(k, t.strip()))
+        return edit
+
+    def _set(self, k, value):
+        self.cur[k] = value
+        self._sync()
+
+    def switch_of(self, page, item):
+        """menu_switch_pair of a list setting's choices as they're shown, or None."""
+        if item["kind"] != "OPTIONS":
+            return None
+        cache = self.__dict__.setdefault("_switches", {})
+        k = self.key(page, item)
+        if k not in cache:
+            cache[k] = menu_switch_pair([menu_label(self.model["strings"], "choice", o["name"], item.get("tags") or ())
+                                         for o in item["options"]])
+        return cache[k]
+
+    def scale_of(self, page, item):
+        """menu_number_list of a list setting's choices as they're shown, or None."""
+        if item["kind"] != "OPTIONS":
+            return None
+        cache = self.__dict__.setdefault("_scales", {})
+        k = self.key(page, item)
+        if k not in cache:
+            cache[k] = menu_number_list([menu_label(self.model["strings"], "choice", o["name"], item.get("tags") or ())
+                                         for o in item["options"]])
+        return cache[k]
+
+    @staticmethod
+    def _slider_text(item, now):
+        """A slider's value in its box, as the game shows a number: "2" for a saved "2.000000".
+        Only the box: the value itself stays as saved."""
+        if now in (None, ""):
+            return menu_value_text(item["min"])
+        try:
+            return menu_value_text(float(now))
+        except (TypeError, ValueError):
+            return str(now).strip()
+
+    LIST_W = (150, 300)                    # a dropdown field's narrowest and widest
+
+    def _fit_lists(self):
+        """Every dropdown field as wide as the longest choice any of them has (so the same width
+        all through the window, lined up at the rows' right end), within LIST_W: a few short
+        choices get a short field, not one that runs half the row (Remos, 30 Oct). A choice longer
+        than the widest field is cut short in the field only; its open list shows it whole."""
+        combos = [c for _p, _i, c, _v, _l in self.rows if isinstance(c, QComboBox)]
+        if not combos:
+            return
+        lo, hi = self.LIST_W
+        w = max(lo, min(hi, max(c.sizeHint().width() for c in combos)))
+        for c in combos:
+            c.setFixedWidth(w)
+
+    def _fit_values(self, more=()):
+        """Every slider's value box as wide as the widest value any of them can show (all the same
+        width, so the sliders line up), never narrower than it was."""
+        boxes, texts = [], set()
+        for page, item, control, value, label in self.rows:
+            scale = self.scale_of(page, item)
+            if scale:
+                boxes.append(value)
+                texts.update(n for n, _note in scale)
+                continue
+            if item["kind"] != "SLIDER":
+                continue
+            boxes.append(value)
+            lo, hi, steps = item["min"], item["max"], item["steps"]
+            step = (hi - lo) / steps if steps else 0
+            picks = range(steps + 1) if steps <= 400 else (0, 1, steps - 1, steps)
+            texts.update(menu_value_text(lo + i * step) for i in picks)
+            texts.add(self._slider_text(item, self.start.get(self.key(page, item))))
+        texts.update(more)
+        if not boxes:
+            return
+        boxes[0].ensurePolished()
+        fm = QFontMetricsF(boxes[0].font())
+        w = max(62, boxes[0].width() if more else 0, math.ceil(max(fm.horizontalAdvance(t) for t in texts)) + 16)
+        for b in boxes:
+            b.setFixedWidth(w)
+
+    def _sync(self):
+        """Every control shows the working values; what differs from the game's is gold."""
+        for page, item, control, value, label in self.rows:
+            k = self.key(page, item)
+            now = self.cur.get(k)
+            control.blockSignals(True)
+            if item["kind"] == "TOGGLE":
+                on = str(now or "").strip().lower() == "true"
+                control.setChecked(on)
+                value.setText("On" if on else "Off")
+                moved = not menu_same(now, self.start.get(k))
+            elif item["kind"] == "SLIDER":
+                lo, hi, steps = item["min"], item["max"], item["steps"]
+                step = (hi - lo) / steps
+                try:
+                    f = float(now)
+                except (TypeError, ValueError):
+                    f = lo
+                i = max(0, min(steps, round((f - lo) / step))) if step else 0
+                control.setValue(i)
+                value.setText(self._slider_text(item, now))
+                if QFontMetricsF(value.font()).horizontalAdvance(value.text()) + 16 > value.width():
+                    self._fit_values((value.text(),))      # a preset's value between steps, say
+                moved = not menu_same(now, self.start.get(k))
+            elif item["kind"] == "OPTIONS":
+                i = self.option_index(page, item, self.cur)
+                scale = self.scale_of(page, item)
+                pair = self.switch_of(page, item)
+                if pair:
+                    control.setChecked(i == pair[1])
+                elif scale:
+                    control.setValue(i)
+                    number, note = scale[i] if 0 <= i < len(scale) else ("", "")
+                    value.setText(number)
+                    value.setToolTip(f"{number} {note}" if note else "")      # "1.0 (Default)"
+                else:
+                    control.setCurrentIndex(i)
+                moved = i != self.option_index(page, item, self.start)
+            else:
+                if control.text() != str(now or ""):
+                    control.setText(str(now or ""))
+                moved = not menu_same(now, self.start.get(k))
+            control.blockSignals(False)
+            if value.property("moved") != moved:
+                value.setProperty("moved", moved)
+                value.style().unpolish(value)
+                value.style().polish(value)
+            dot = self.dots.get(k)
+            if dot is not None:
+                dot.set_on(moved)
+        for n, page in enumerate(self.model["pages"]):
+            item = self.pages.item(n)
+            if item is not None:
+                differs = any(self.dots[self.key(pg, it)].property("on") for pg, it, _c, _v, _l in self.rows
+                              if pg is page and self.key(pg, it) in self.dots)
+                if bool(item.data(MenuPageDelegate.CHANGED)) != differs:
+                    item.setData(MenuPageDelegate.CHANGED, differs)
+        if getattr(self, "page_defaults", None):
+            self.defaults_link.setEnabled(not all(menu_same(self.cur.get((sec.lower(), key.lower())), val)
+                                                  for sec, key, val in self.page_defaults))
+        for pr, b in self.preset_btns:
+            active = bool(pr["entries"]) and all(menu_same(self.cur.get((sec.lower(), key.lower())), val)
+                                                 for sec, key, val in pr["entries"])
+            if b.property("active") != active:
+                b.setProperty("active", active)
+                b.style().unpolish(b)
+                b.style().polish(b)
+        changed = self.changes()
+        running = game_running()
+        nofile = not self.model.get("file") and not self.model.get("kept")
+        hide_moved = hasattr(self, "hide_switch") and self.hide_switch.isChecked() != self.hidden_at_start
+        self.save_btn.setEnabled((bool(changed) and not nofile or hide_moved) and not running)
+        self.save_btn.setToolTip("Close the game first: it writes these settings when it closes." if running
+                                 else "No settings file yet. Start the game once first." if nofile else "")
+        n = len(changed) + (1 if hide_moved else 0)
+        self.note.setText(f"{n} changed" if n else "")
+        if running:
+            self.state_note.setText("The game is running")
+            self.state_note.setToolTip("These are the values it had when it last closed. Save waits until it's closed.")
+        elif self.model.get("kept") or not self.model.get("menu_on", True):
+            # why its menu isn't in the game, in a few words; what that means in the tooltip
+            m = self.mgr.get(self.mid) or {}
+            self.state_note.setText("All mods are off" if self.mgr.state.get("mods_off")
+                                    else "This mod is off" if not m.get("enabled")
+                                    else "Its menu is left out" if "menu" in (m.get("snippets_off") or ())
+                                    else "Its settings go back soon")
+            self.state_note.setToolTip("The game forgets a mod's menu settings while the menu isn't in the game. The app "
+                                       "keeps them, shows them here, and puts them back when it's on again. "
+                                       "What you save here is kept too.")
+        else:
+            self.state_note.setText("")
+            self.state_note.setToolTip("")
+
+    # --- behaviour
+    def eventFilter(self, obj, e):
+        if obj.property("menu_tip") is not None:
+            if e.type() == QEvent.Type.Enter:
+                self._hover_timer().stop()
+                self._describe(obj.property("menu_tip") or "")
+            elif e.type() == QEvent.Type.Leave:
+                self._hover_timer().start()     # off the settings, not just on to the next one: see _hover_gone
+        return super().eventFilter(obj, e)
+
+    def _hover_timer(self):
+        t = getattr(self, "_hover_t", None)
+        if t is None:
+            t = self._hover_t = QTimer(self, singleShot=True, interval=120)
+            t.timeout.connect(self._hover_gone)
+        return t
+
+    def _hover_gone(self):
+        """The pointer left a setting: unless it's on another one now, the card goes back to the page's
+        own text, or blank (Remos, 30 Oct: it stayed on the last setting pointed at)."""
+        w = QApplication.widgetAt(QCursor.pos())
+        while w is not None and w is not self:
+            if w.property("menu_tip") is not None or w is self.info_box:
+                return                          # on to another setting (its Enter said what to show), or
+            w = w.parentWidget()                # down to the card to read it: it stays
+        self._describe("")
+
+    def _text_height(self, text):
+        """How tall a description is in the card, at the window's width."""
+        # the card spans the window less its margins (22 each side); inside, its own padding (12
+        # each side), the "i" (18) and the gap after it (10)
+        doc = QTextDocument()
+        doc.setDefaultFont(self.info.font())
+        doc.setDocumentMargin(0)
+        doc.setTextWidth(max(200, self.width() - 44 - 24 - 18 - 10))
+        doc.setHtml(text)
+        return doc.size().height() + 2
+
+    def _fit_info(self):
+        """The description card's height for the page shown: what most of its texts need (and its
+        own text), at least two lines. It grows for a longer one and doesn't shrink back while the
+        page stays, so moving from one setting to the next never makes it jump (Remos, 30 Oct: the
+        other ways tried, a card that follows its text or one that scrolls, were worse)."""
+        i = self.pages.currentRow() if hasattr(self, "pages") else -1
+        if not 0 <= i < len(self.model["pages"]) or not self.info_box.isVisibleTo(self):
+            return
+        page = self.model["pages"][i]
+        lines = self.info.fontMetrics().lineSpacing()
+        heights = sorted(self._text_height(t) for t in (row[2].property("menu_tip") or "" for row in self.rows if row[0] is page) if t)
+        usual = heights[(len(heights) * 3) // 4] if heights else 0          # what three in four of them need
+        own = menu_rich(self.model.get("descriptions", {}).get("pages", {}).get(page["group"].lower(), ""), self.mgr.menu_image)
+        self.info.setFixedHeight(int(max(lines * 2, usual, self._text_height(own) if own else 0)))
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if hasattr(self, "info_box"):
+            self._fit_info()
+
+    def _describe(self, text):
+        """The description card: a setting's description; without one the page's own text, when
+        the mod gives one (as the game shows it when nothing else is); else an empty space."""
+        if not text:
+            i = self.pages.currentRow() if hasattr(self, "pages") else -1
+            if 0 <= i < len(self.model["pages"]):
+                text = menu_rich(self.model.get("descriptions", {}).get("pages", {}).get(self.model["pages"][i]["group"].lower(), ""), self.mgr.menu_image)
+        self.info.setTextFormat(Qt.TextFormat.RichText)
+        self.info.setText(text)
+        if text:
+            need = int(min(self._text_height(text), self.info.fontMetrics().lineSpacing() * 18))
+            if need > self.info.height():
+                self.info.setFixedHeight(need)
+        self.info_mark.setVisible(bool(text))
+        if self.info_box.property("empty") != (not text):
+            self.info_box.setProperty("empty", not text)
+            self.info_box.style().unpolish(self.info_box)
+            self.info_box.style().polish(self.info_box)
+
+    def _show_page(self, i):
+        self.stack.setCurrentIndex(i)
+        while self.preset_row.count():
+            w = self.preset_row.takeAt(0).widget()
+            if w:
+                w.hide()
+                w.setParent(None)
+                w.deleteLater()
+        pages = self.model["pages"]
+        page = pages[i] if 0 <= i < len(pages) else None
+        self.preset_btns = []
+        if page and page["presets"]:
+            self.preset_row.addWidget(QLabel("Presets", objectName="Muted"))
+            for pr in page["presets"]:
+                b = QPushButton(menu_label(self.model["strings"], "value", pr["name"]), objectName="PresetBtn")
+                b.setToolTip("The values on this page are this preset's.")
+                b.clicked.connect(lambda _c=False, pr=pr: self._apply(pr["entries"]))
+                self.preset_row.addWidget(b)
+                self.preset_btns.append((pr, b))
+        self.page_defaults = []
+        if page:
+            entries = self.default_entries(page)
+            if entries and not any(self._same_preset(pr["entries"], entries) for pr in page["presets"]):
+                self.page_defaults = entries
+        self.defaults_link.setVisible(bool(self.page_defaults))
+        self.preset_row.addStretch(1)
+        self._fit_info()
+        self._describe("")
+        if hasattr(self, "save_btn"):
+            self._sync()
+
+    def _apply(self, entries):
+        """A preset: every value it lists, in whichever section it names."""
+        for sec, key, val in entries:
+            self.cur[(sec.lower(), key.lower())] = val
+        self._sync()
+
+    def default_entries(self, page):
+        """[(section, key, value)] the mod gives a page's settings: each one's default; for a list,
+        what its default choice sets (its first choice when it names none)."""
+        out = []
+        for item in page["items"]:
+            if item["kind"] == "SEPARATOR" or item.get("hidden"):
+                continue
+            if item["kind"] == "OPTIONS":
+                d = item.get("default")
+                i = self.option_index(page, item, {**self.defaults, self.key(page, item): d}) if d not in (None, "") else 0
+                o = item["options"][i]
+                out += o["entries"] if o["entries"] else [(item.get("section") or page["group"], item["id"], str(i))]
+            elif item.get("default") is not None and item.get("given", True):
+                # one the mod gives no value (Brutal Blood's DynamicDecalsLimit, the game's own setting)
+                # has no mod default: left as it is, not set to 0
+                out.append((item.get("section") or page["group"], item["id"], item["default"]))
+        return out
+
+    @staticmethod
+    def _same_preset(entries, defaults):
+        """Does a preset set every one of these values, to the same?"""
+        sets = {(sec.lower(), key.lower()): val for sec, key, val in entries}
+        return all((sec.lower(), key.lower()) in sets and menu_same(sets[(sec.lower(), key.lower())], val)
+                   for sec, key, val in defaults)
+
+    def _page_defaults(self):
+        """The page shown back to the mod's defaults (its "Mod defaults" preset)."""
+        i = self.pages.currentRow()
+        if 0 <= i < len(self.model["pages"]):
+            self._apply(self.default_entries(self.model["pages"][i]))
+
+    def hide_changed(self):
+        """Was "Hide the Menu in-game" switched (the window's owner then places the files)?"""
+        return self.hide_switch.isChecked() != self.hidden_at_start
+
+    def _save(self):
+        try:
+            if self.changes():
+                self.mgr.save_menu_values(self.changes(), mid=self.mid)
+            elif game_running():
+                raise RuntimeError("The game is running. Close it first.")
+        except RuntimeError as e:
+            self.note.setText(str(e).split(".")[0])
+            return
+        if self.hide_changed():
+            self.mgr.set_menu_hidden(self.mid, self.hide_switch.isChecked())
+        self.accept()
+
+
+class StrayFilesDialog(RememberingDialog):
+    """Uninstalling: the files in the mods' folders that the app didn't put there (their tools made
+    them while the game ran, or you did), each with a checkbox. Ticked ones go to the Trash. Ticked
+    to start with when they can only be these mods'; a file another mod staying installed might
+    have made, or one only known by when it was made, starts unticked, with why."""
+    window_key = "strays"
+
+    def __init__(self, parent, found):
+        super().__init__(parent)
+        self.setWindowTitle("Also remove?")
+        v = QVBoxLayout(self)
+        v.setContentsMargins(20, 18, 20, 16)
+        v.setSpacing(12)
+        n = len(found)
+        lead = QLabel(f"{n} file{'s' * (n != 1)} in these mods' folders {'weren' if n != 1 else 'wasn'}'t put there "
+                      "by the app: the mods' tools made them while the game ran, or you did. "
+                      "Ticked ones go to the Trash.")
+        lead.setWordWrap(True)
+        v.addWidget(lead)
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["File", "Size", ""])
+        self.tree.setIconSize(QSize(16, 16))
+        self.tree.setUniformRowHeights(True)
+        self.tree.setFrameShape(QFrame.Shape.NoFrame)
+        hdr = self.tree.header()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setStretchLastSection(False)
+        self.tree.headerItem().setTextAlignment(1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        soft_branch_selection(self.tree)
+        game = getattr(parent.mgr, "game", None) if parent is not None and getattr(parent, "mgr", None) else None
+        folders = {}
+        self.items = []
+        for rel, others, sure in found:
+            d, _, name = rel.rpartition("/")
+            head = folders.get(d.lower())
+            if head is None:
+                head = QTreeWidgetItem([d + "/", "", ""])
+                head.setIcon(0, file_icon("folder"))
+                head.setFlags(head.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsAutoTristate)
+                head.setCheckState(0, Qt.CheckState.Unchecked)
+                self.tree.addTopLevelItem(head)
+                folders[d.lower()] = head
+            it = QTreeWidgetItem([name, "", ""])
+            it.setIcon(0, file_icon(file_icon_kind(name)))
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            it.setData(0, Qt.ItemDataRole.UserRole, rel)
+            try:
+                it.setText(1, human_size((game / rel).stat().st_size) if game else "")
+            except OSError:
+                pass
+            it.setTextAlignment(1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            it.setForeground(1, QBrush(QColor(C["ash"])))
+            if not sure:
+                # a short note; who else might have made it in the tooltip, every one listed
+                if others:
+                    why = "Maybe another mod's"
+                    tip = ("Maybe a different mod created it\n\n"
+                           + "\n".join(sorted(others, key=str.lower)))
+                else:
+                    why = "Made after it was installed"
+                    tip = "Known only by when it was made, so it starts unticked."
+                it.setText(2, why + "  ")
+                it.setForeground(2, QBrush(QColor(C["ash"])))
+                for col in range(3):
+                    it.setToolTip(col, tip)
+            head.addChild(it)
+            it.setCheckState(0, Qt.CheckState.Checked if sure else Qt.CheckState.Unchecked)
+            self.items.append(it)
+        self.tree.expandAll()
+        v.addWidget(self.tree, 1)
+        bb = QDialogButtonBox()
+        self.go = bb.addButton("Remove ticked", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.go.setObjectName("Primary")
+        bb.addButton("Keep all", QDialogButtonBox.ButtonRole.RejectRole)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        v.addWidget(bb)
+        self.tree.itemChanged.connect(lambda *_: self.go.setEnabled(bool(self.ticked())))
+        self.go.setEnabled(bool(self.ticked()))
+        self.resize(640, min(620, 170 + 30 * (len(found) + len(folders))))
+        self.restore_size()
+        if self.width() > 1000:          # a size saved while the long notes stretched it
+            self.resize(640, self.height())
+
+    def ticked(self):
+        return [it.data(0, Qt.ItemDataRole.UserRole) for it in self.items if it.checkState(0) == Qt.CheckState.Checked]
+
+
 class InstallCard(QFrame):
     """A card in the Install window: a title row with an arrow that folds it to that row (a
     short summary then shows on the right), and its content underneath."""
@@ -16379,7 +23207,7 @@ class TipRows(QObject):
 
 SNIPPET_KINDS = (("menu", "Mod menu"), ("user", "user.settings · dx12user.settings"),
                  ("user_own", "user.settings · dx12user.settings"), ("input", "input.settings"),
-                 ("input_xml", "input.xml"))
+                 ("input_preset", "input.settings"), ("input_xml", "input.xml"))
 KIND_NAME = dict(SNIPPET_KINDS)
 
 
@@ -16416,6 +23244,15 @@ def snippet_rows(found, remastered=False, menus=()):
         rows.append(("user_own", KIND_NAME["user_own"],
                      f"{n} value{'s' if n != 1 else ''}, from {names}" if names else f"{n} value{'s' if n != 1 else ''}",
                      tip_section(KIND_NAME["user_own"], "silver", blocks, note)))
+    preset = found.get("input_preset_sections") or []
+    if preset:
+        n = len(preset)
+        blocks = [f"<p style='margin:8px 0 0 0'>" + "<br>".join(f"<span style='color:{steel}'>[{esc(x)}]</span>"
+                                                                 for x in preset) + "</p>"]
+        note = ("A keybind preset. Each of these sections takes your section's place. Yours come back "
+                "when it's off or removed, unless you changed one since.")
+        rows.append(("input_preset", KIND_NAME["input_preset"], f"Keybind preset, {n} section{'s' if n != 1 else ''}",
+                     tip_section(KIND_NAME["input_preset"], "silver", blocks, note)))
     keys = found.get("keybind_lines") or {}
     if keys:
         n = sum(len(v) for v in keys.values())
@@ -16726,6 +23563,7 @@ class InstallDialog(ModFieldsMixin, ListFit, RememberingDialog):
             self.table.setItem(r, 0, use)
             rel = e["src"].relative_to(tmpdir).as_posix()
             src_item = self._ro(r, 1, "(archive root)" if rel == "." else rel + "/")
+            src_item.setIcon(file_icon("folder"))
             src_item.setToolTip(src_item.text())
             if r in self.matched:
                 src_item.setText(src_item.text() + f"   ✓ your game ({gen_name})")
@@ -16774,11 +23612,14 @@ class InstallDialog(ModFieldsMixin, ListFit, RememberingDialog):
 
         # --- what the game folder gets
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["Path", "Files"])
+        self.tree.setHeaderLabels(["Path", "Files", "Size"])
         self.tree.setUniformRowHeights(True)
         self.tree.setFrameShape(QFrame.Shape.NoFrame)
         self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        for col in (1, 2):                                 # headings over their numbers' right edge
+            self.tree.headerItem().setTextAlignment(col, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.tree.header().setStretchLastSection(False)
         self.tree.setMinimumHeight(120)
 
@@ -16801,6 +23642,9 @@ class InstallDialog(ModFieldsMixin, ListFit, RememberingDialog):
         # the file preview always starts folded: open it when you want to check where files go
         self.tree_card = InstallCard("Added to the game folder", self.tree, folded=True)
         v.addWidget(self.tree_card, 1)
+        if not plan:                                       # a settings preset: nothing goes in the game folder
+            self.table_card.setVisible(False)
+            self.tree_card.setVisible(False)
         self._spacer = QWidget()                           # takes the room when the preview is folded
         v.addWidget(self._spacer, 1)
         self._spacer.setVisible(self.tree_card.folded)
@@ -16870,8 +23714,19 @@ class InstallDialog(ModFieldsMixin, ListFit, RememberingDialog):
             name = ensure_mod_prefix(name)
         return kind, name
 
+    def _file_size(self, src, rel):
+        """A file's size in the archive as unpacked, read once."""
+        cache = self.__dict__.setdefault("_sizes", {})
+        key = (str(src), rel)
+        if key not in cache:
+            try:
+                cache[key] = (Path(src) / rel).stat().st_size
+            except OSError:
+                cache[key] = 0
+        return cache[key]
+
     def _rebuild(self):
-        canon, paths = {}, []
+        canon, paths, sizes = {}, [], {}
 
         def canon_dir(path):
             # the game folder is case-insensitive under Wine, so Config/ and config/ are one folder
@@ -16891,8 +23746,10 @@ class InstallDialog(ModFieldsMixin, ListFit, RememberingDialog):
                 if rem and (full.lower().startswith("bin/x64/") or full.lower() in skip):
                     continue                             # not placed on 5.x (no DX11 build, no filelists)
                 d, _, f = full.rpartition("/")
-                paths.append(f"{canon_dir(d)}/{f}" if d else f)
-        fill_path_tree(self.tree, paths)
+                shown = f"{canon_dir(d)}/{f}" if d else f
+                paths.append(shown)
+                sizes[shown] = self._file_size(row["src"], rel)
+        fill_path_tree(self.tree, paths, sizes=sizes)
         n = len(paths)
         self.tree_card.set_summary(f"{n} file{'s' if n != 1 else ''}")
         self._refit()                                     # other files: the preview's height follows
@@ -17119,15 +23976,25 @@ class EditModDialog(ModFieldsMixin, ListFit, RememberingDialog):
             self._snip_summary()
             v.addWidget(self.snip_card)
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["Path", "Files"])
+        self.tree.setHeaderLabels(["Path", "Files", "Size"])
         self.tree.setUniformRowHeights(True)
         self.tree.setFrameShape(QFrame.Shape.NoFrame)
         self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        for col in (1, 2):                                 # headings over their numbers' right edge
+            self.tree.headerItem().setTextAlignment(col, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.tree.header().setStretchLastSection(False)
         self.tree.setMinimumHeight(120)
         files = mgr.mod_files(mod)
-        fill_path_tree(self.tree, files)
+        base = mgr.stage_dir(mod)
+        sizes = {}
+        for rel in files:
+            try:
+                sizes[rel] = (base / rel).stat().st_size
+            except OSError:
+                sizes[rel] = 0
+        fill_path_tree(self.tree, files, sizes=sizes)
         self.files_card = InstallCard("Installed files", self.tree, f"{len(files)} file{'s' if len(files) != 1 else ''}",
                                       folded=True)
         self.files_card.toggled.connect(self._files_toggled)
@@ -17939,6 +24806,7 @@ class ModGroup(QFrame):
             inner.layout().activate()
         QApplication.sendPostedEvents(None, QEvent.Type.LayoutRequest)
         self.panel.scroll.viewport().repaint()
+        self.panel.relink()                       # folded or opened: the selected mod's file or this card
 
     def pending_update(self):
         """The downloaded files in it that are a newer version of what you have installed."""
@@ -17967,6 +24835,21 @@ class ModGroup(QFrame):
             r.setVisible(not fold and (shown is None or r in shown))
         one = self.rows[0] if len(self.rows) == 1 else None
         self.trash.setVisible(bool(one) and not fold and not one.running() and bool(one.files_on_disk()))
+
+    def enterEvent(self, e):
+        on = bool(self.panel.mods_of(self.rows))
+        self.setCursor(Qt.CursorShape.PointingHandCursor if on else Qt.CursorShape.ArrowCursor)
+        self.setToolTip("Click to show its mods in your mod list" if on and len(self.rows) > 1
+                        else "Click to show it in your mod list" if on else "")
+        super().enterEvent(e)
+
+    def mousePressEvent(self, e):
+        """A click on the card itself (not its name, which folds it): every mod installed from
+        its files selected in the list."""
+        if e.button() == Qt.MouseButton.LeftButton and self.panel.show_in_list(self.rows):
+            e.accept()
+            return
+        super().mousePressEvent(e)
 
     def contextMenuEvent(self, e):
         """Right-click the mod's card: its Nexus page, the folder, and the card's own actions."""
@@ -18098,6 +24981,19 @@ class DownloadRow(QFrame):
             self.title.hide()
             self.btn_trash.hide()
         self.title.setToolTip(tip)
+
+    def enterEvent(self, e):
+        # installed: a click shows it in the mod list (the hand says so)
+        on = bool(self.panel.mods_of([self]))
+        self.setCursor(Qt.CursorShape.PointingHandCursor if on else Qt.CursorShape.ArrowCursor)
+        self.setToolTip("Click to show it in your mod list" if on else "")
+        super().enterEvent(e)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and self.panel.show_in_list([self]):
+            e.accept()
+            return
+        e.ignore()                                  # not installed: the click is the card's (its page's mods)
 
     def set_nested(self, nested):
         """A sub-card of its own when the mod has several files; part of the mod's card
@@ -18531,6 +25427,7 @@ class DownloadsPanel(QWidget):
         self.refresh_visible()
         if on:
             self.main.fit_panel(max(self.stored_width(), self.minimumWidth()))
+            QTimer.singleShot(0, self.relink)        # the mod selected in the list: its download
         if resize and not on:
             self.main.panel_resizing(False, room)                      # panel gone, then shrink
         self.button.set_state(on, len(self.running()))
@@ -18679,6 +25576,68 @@ class DownloadsPanel(QWidget):
             self.scroll.ensureWidgetVisible(widget, 0, 12)
         except RuntimeError:                     # the card went in the meantime
             pass
+
+    # --- the mods selected in the list, and their downloads
+    def card_for(self, m):
+        """Where a mod's download is in the panel: the very file it was installed from (its own
+        sub-card when its mod's card holds several and is open, else the card), or else the card
+        of its Nexus page. None when there's neither."""
+        arc = os.path.basename(m.get("archive") or "").lower()
+        row = next((r for r in self.rows if arc and r.path and os.path.basename(r.path).lower() == arc), None) \
+            or next((r for r in self.rows if arc and (r.meta.get("file_name") or "").lower() == arc), None)
+        if row is not None and row.group is not None:
+            return row if getattr(row, "_nested", False) and row.isVisibleTo(row.group) else row.group
+        nid = str(m.get("nexus") or "")
+        return (self.groups.get(nid) if nid else None) or self.groups.get(f"local-{m['id']}")
+
+    def link_mods(self, mods):
+        """The mods selected in the list: their download gets a steady bronze edge and is scrolled
+        into view (only as far as needed). One mod, or several from the same Nexus page (their
+        page's card); anything else, nothing. Only while the panel is open: it's never opened
+        for this."""
+        self._link_ids = [m["id"] for m in mods]
+        target = None
+        if self.isVisible() and mods:
+            cards = [self.card_for(m) for m in mods]
+            if len(cards) == 1:
+                target = cards[0]
+            elif all(c is not None for c in cards):
+                groups = {id(c if isinstance(c, ModGroup) else c.group): (c if isinstance(c, ModGroup) else c.group)
+                          for c in cards}
+                target = next(iter(groups.values())) if len(groups) == 1 else None
+        old = getattr(self, "_linked", None)
+        if old is not None and old is not target:
+            try:
+                restyle(old, "linked", False)
+            except RuntimeError:                 # the card went meanwhile
+                pass
+        self._linked = target
+        if target is None:
+            return
+        restyle(target, "linked", True)
+        if target.isVisibleTo(self.body):        # not one the filter hides
+            QTimer.singleShot(0, lambda: self._scroll_to(target))
+
+    def relink(self):
+        """The cards changed (a download added or gone, the filter, the panel opened): the
+        selected mods' download is found again."""
+        mgr = self.main.mgr
+        if mgr is None:
+            return
+        mods = [m for m in (mgr.get(i) for i in getattr(self, "_link_ids", ())) if m]
+        self.link_mods(mods)
+
+    def mods_of(self, rows):
+        """The installed mods these downloads are versions of (in the list's order)."""
+        hits = {(self.match(r)[0] or {}).get("id") for r in rows if r.state == "done"} - {None}
+        return [m["id"] for m in self.main.mgr.mods if m["id"] in hits] if self.main.mgr else []
+
+    def show_in_list(self, rows):
+        """A download clicked: the mods it installed selected in the list and scrolled to."""
+        ids = self.mods_of(rows)
+        if ids:
+            self.main.select_mods(ids)
+        return ids
 
     def flash(self, widget, times=3):
         """Light a card's border up a few times, then put it back."""
@@ -18938,6 +25897,7 @@ class DownloadsPanel(QWidget):
         self.apply_filter()                          # new cards follow the filter that's on
         self.update_summary()
         self.button.set_state(self._open, len(self.running()))
+        self.relink()
 
     def cancel_all(self):
         for r in self.running():
@@ -19038,6 +25998,7 @@ class MainWindow(RememberSize, QMainWindow):
         self.act_check.setVisible(nexus_on(self.cfg))
         self.act_resolve = more.addAction(theme_icon("merge", "document-edit"), "Script decisions…",
                                           lambda: self.open_resolver())
+        self.act_remerge = more.addAction(theme_icon("view-refresh", "merge"), "Merge again", self.merge_again)
         self.act_merger = more.addAction(theme_icon("merge", "document-edit"), "Run Script Merger (legacy)",
                                          self.run_merger)
         self.act_merger.setVisible(merger_ok(self.cfg.get("merger_path")))   # only with a valid path
@@ -19098,8 +26059,18 @@ class MainWindow(RememberSize, QMainWindow):
         self.tree.filesDropped.connect(self.install_archives)
         self.tree.customContextMenuRequested.connect(self.context_menu)
         self.tree.collapseChanged.connect(self.on_collapse_changed)
+        self.tree.menuClicked.connect(self.open_menu_settings)
         self.tree.tip.winClicked.connect(self.make_win)
+        self.tree.tip.viewClicked.connect(self.view_merged)
         self.tree.itemClicked.connect(self._row_clicked)
+        # a mod just installed marks its section until you select it again (it's selected right
+        # after the install: that one doesn't count) or FRESH_FOR runs out
+        self._fresh_armed = set()
+        self.tree.itemSelectionChanged.connect(self._fresh_selection)
+        self._fresh_timer = QTimer(self)
+        self._fresh_timer.setInterval(60_000)
+        self._fresh_timer.timeout.connect(lambda: self.mgr and self.mgr.clear_fresh() and self._mark_fresh())
+        self._fresh_timer.start()
         outer.addWidget(self.tree, 1)
 
         self.empty = QLabel("No mods yet\n\nClick Install mods, or drop .zip / .7z / .rar files here",
@@ -19241,6 +26212,9 @@ class MainWindow(RememberSize, QMainWindow):
                 return
         else:
             self.load_manager()
+        if self.mgr and self.cfg.get("merger_dpi_restore"):
+            # the app closed while Script Merger ran: the prefix gets its own DPI back now
+            QTimer.singleShot(3000, self.restore_merger_dpi)
         moved = os.environ.pop("W3MM_MOVED_FROM", "")
         if moved and moved != str(APP_DIR):
             short = self.cfg.get("shortcut")
@@ -19610,6 +26584,7 @@ class MainWindow(RememberSize, QMainWindow):
             self.status.say("Close the game first", "Mods can't be turned off or on while the game is running.")
             return
         if self.mgr.all_off():
+            # parked by an older version of the app (folders moved aside): put back as before
             def back(left):
                 if left:
                     self.status.say("Mods on, some files kept aside",
@@ -19619,14 +26594,31 @@ class MainWindow(RememberSize, QMainWindow):
                 else:
                     self.status.setText("Mods on")
             self.run_task("Turning mods on…", self.mgr.turn_all_on, on_done=back)
+        elif self.mgr.marked():
+            self.run_task("Turning marked mods back on…", self.mgr.switch_marked_on,
+                          on_done=lambda n: self.status.say(f"{n} mod{'s' * (n != 1)} back on", ""))
         else:
-            self.run_task("Turning all mods off…", self.mgr.turn_all_off)
+            def done(n):
+                if not n:
+                    self.status.say("No mods are on", "")
+                    return
+                hand = len(self.mgr.unmanaged_mods())
+                self.status.say(f"All mods off · {n} marked",
+                                "The mods that were on are marked. Tick them back on one or a few at a time; "
+                                "a mark goes when its mod is on again. ••• → Turn marked mods back on puts "
+                                "them all back."
+                                + (f"\n\n{hand} folder{'s' * (hand != 1)} in the mods folder that this app "
+                                   "doesn't manage stay{'s' * (hand == 1)} as {'they are' if hand != 1 else 'it is'}."
+                                   if hand else ""))
+            self.run_task("Turning all mods off…", self.mgr.switch_all_off, on_done=done)
 
     def _show_all_off(self):
         """While all mods are off: the list dimmed, the menu offers them back, the status says so."""
         off = bool(self.mgr and self.mgr.all_off())
-        self.act_all_off.setText("Turn mods back on" if off else "Turn all mods off")
-        self.act_all_off.setIcon(theme_icon("media-playback-start", "system-run") if off
+        marked = bool(self.mgr and not off and self.mgr.marked())
+        self.act_all_off.setText("Turn mods back on" if off else "Turn marked mods back on" if marked
+                                 else "Turn all mods off")
+        self.act_all_off.setIcon(theme_icon("media-playback-start", "system-run") if off or marked
                                  else theme_icon("media-playback-pause", "process-stop"))
         vp = self.tree.viewport()
         if off and not isinstance(vp.graphicsEffect(), QGraphicsOpacityEffect):
@@ -19697,6 +26689,7 @@ class MainWindow(RememberSize, QMainWindow):
         self.mgr.save_game_versions()
         KEPT.save()
         tip_prio = {}
+        marked = self.mgr.marked()               # switched off by "Turn all mods off", still off
         win_map = {}                             # names in tooltips -> the mod a click there moves
         for pmid, pairs in rows.items():
             pm = self.mgr.get(pmid)
@@ -19709,6 +26702,7 @@ class MainWindow(RememberSize, QMainWindow):
         win_map = {k: v for k, v in win_map.items() if v}
         dim, ash = QBrush(QColor(C["dim"])), QBrush(QColor(C["ash"]))
         headed = set()
+        fresh = self.mgr.fresh_sections()
         for m in self.mgr.rows:
             g = None if m.get("sep") else self._link_groups.get(m["id"])
             if g and g.get("head") and g["run"] not in headed:
@@ -19722,6 +26716,7 @@ class MainWindow(RememberSize, QMainWindow):
                 it.setData(0, Qt.ItemDataRole.UserRole, m["id"])
                 it.setData(0, SEP_ROLE, True)
                 it.setData(0, COLLAPSED_ROLE, bool(m.get("collapsed")))
+                it.setData(0, FRESH_ROLE, m["id"] in fresh)
                 it.setFlags((it.flags() | Qt.ItemFlag.ItemIsEditable | Qt.ItemFlag.ItemIsDragEnabled)
                             & ~Qt.ItemFlag.ItemIsDropEnabled & ~Qt.ItemFlag.ItemIsUserCheckable)
                 it.setToolTip(0, "Click to fold. Drag to move the whole section.")
@@ -19752,35 +26747,95 @@ class MainWindow(RememberSize, QMainWindow):
                         out.append(name)
                 return out
 
-            def scripts(recs, extra=lambda r: ""):
+            def scripts(recs, extra=lambda r: "", linked=False, used=False):
                 mine = {label.replace(" (not managed here)", "")
                         for r in recs for label, owner in merge_contributors(r)
                         if owner == m["id"]} or {m["name"]}
-                return file_groups([(r["rel"], mods_of(r), extra(r)) for r in recs], me=mine, prio=tip_prio)
+                links = {r["rel"]: r["key"] for r in recs if linked and not r["key"].startswith(INI_KEY)}
+                return file_groups([(r["rel"], mods_of(r), extra(r)) for r in recs], me=mine, prio=tip_prio,
+                                   links=links, all_used=used)
 
             if mg["pending"]:
                 n = len(mg["pending"])
                 chips.append((f"⚑ {n}", "bad"))                       # scripts waiting for your decision
-                attach((0, tip_section("Needs your decision", "blood", scripts(mg["pending"]),
+                attach((0, tip_section(f"Needs your decision · {n}", "blood", scripts(mg["pending"]),
                                             "Until then, the higher priority's copy is used. "
                                             "Right-click → Script decisions…")))
             if mg["failed"]:
                 n = len(mg["failed"])
                 chips.append((f"✕ {n}", "bad"))                       # scripts a safety check refused
-                attach((0, tip_section("Not merged", "blood",
+                attach((0, tip_section(f"Not merged · {n}", "blood",
                                             scripts(mg["failed"], lambda r: r.get("reason", "")),
                                             "A safety check stopped it, so the higher priority's copy is used. "
                                             "If it's your decision, change it: Right-click → Script decisions…")))
-            if d["annot"]:
-                n = len(d["annot"])
-                chips.append((f"@ {n}", "bad"))                       # same symbol added by two mods
-                verb = {"@replacemethod": "Also replaced or changed by "}
-                blocks = [f"<p style='margin:8px 0 0 0'><span style='color:{C['steel']}'>{html.escape(shown)}</span><br>"
-                          f"<span style='color:{C['ash']}'>{html.escape(verb.get(kind, 'Also added by ') + ', '.join(others))}</span></p>"
-                          for (kind, shown), others in sorted(d["annot"], key=lambda a: a[0][1].lower())]
-                attach((0, tip_section("Won't work together", "blood", blocks,
-                                            "Another mod adds or replaces the same function or variable. "
-                                            "The game can't use both. Keep one on.")))
+            brk = d.get("breaks") or []
+            if d["annot"] or d["pre_used"] or d["pre_wrap"] or brk:
+                # functions and variables more than one mod's scripts claim: one chip, red when
+                # something can't work at all, amber when only one version of it is used
+                n = len(d["annot"]) + len(d["pre_used"]) + len(d["pre_wrap"]) + len(brk)
+                chips.append((f"ƒ {n}", "bad" if d["annot"] or brk else "warn"))
+                me = m["name"]
+                if brk:
+                    # what its scripts point at that isn't there: the game's scripts don't compile
+                    lines = []
+                    for b in brk:
+                        why = {"class": "no such class", "function": "no such function",
+                               "base": "no such class to build on"}[b["what"]]
+                        if b["provider"]:
+                            why = f"{b['provider']} has it, but it's switched off"
+                        line = (f"<span style='color:{C['silver']}'>{html.escape((b['ann'] + ' ') if b['ann'] else '')}"
+                                f"{html.escape(b['shown'])}</span><br><span style='color:{C['ash']}'>{html.escape(why)}</span>")
+                        if b["file"]:
+                            line += "<br>" + file_html(f"content/scripts/{b['file']}")
+                        lines.append(f"<p style='margin:10px 0 0 0'>{line}</p>")
+                    attach((0, tip_section(f"Won't compile · {len(brk)}", "blood", lines,
+                                           "Its scripts point at something no loaded script has, so the game's scripts "
+                                           "won't compile and the game won't start. Usually a mod made for another game "
+                                           "version, or one that needs a mod that's missing or switched off.")))
+
+                if d["annot"]:
+                    blocks = fn_groups([(shown, [], [me] + list(others), (),
+                                         "Both precompiled: what the game does then isn't known." if blob_only else "")
+                                        for (kind, shown), others, blob_only in d["annot"]])   # nor here
+                    attach((0, tip_section(f"Won't work together · {len(d['annot'])}", "blood", blocks,
+                                                "Each adds or replaces the same thing. The game won't start with both: "
+                                                "its scripts don't compile. Keep one on.")))
+                if d["pre_used"]:
+                    # scripts matter more than textures: a lost script function can leave a mod half
+                    # working. Warned when one of its script files is lost whole (whatever that file
+                    # does in the mod doesn't happen), or more than a third of its script changes
+                    lost = {shown.lower() for shown, *_r in d["pre_used"]}
+                    by_file = self.mgr.script_changes_by_file(m["id"])
+                    total = set().union(lost, *by_file.values())
+                    whole = sorted((rel for rel, names in by_file.items() if names <= lost),
+                                   key=lambda r: Path(r).name.lower())
+                    advice = " Best to remove one of them since they are clearly not compatible."
+                    if lost >= total:
+                        attach((0, tip_section("Scripts fully unused", "bronze_hi", [],
+                                               "None of its script changes are used, so its scripts do nothing." + advice)))
+                    elif whole or len(lost) * 3 > len(total):
+                        # the file's name, .ws and all, brighter than the words around it
+                        bright = lambda n: f"<span style='color:{C['silver']}'>{html.escape(n)}</span>"
+                        names = [bright(Path(r).name) for r in whole]
+                        what = (f"None of its changes from "
+                                f"{names[0] if len(names) == 1 else ', '.join(names[:-1]) + ' and ' + names[-1]} are used."
+                                if names else "Many of its script changes aren&#x27;t used.")
+                        attach((0, tip_section("Scripts partly unused", "bronze_hi", [],
+                                               what + " The mod might not work properly or work only partly."
+                                               + html.escape(advice), rich_note=True)))
+                if d["pre_used"]:
+                    blocks = fn_groups([(shown, winners, [me], files, "", d["blob_of"].get(shown))  # priority changes nothing here
+                                        for shown, how, winners, files in d["pre_used"]])
+                    attach((1, tip_section(f"Script blobs · {len(d['pre_used'])}", "bronze_hi", blocks,
+                                                "The blue mod uses precompiled script blobs, which win over loose scripts regardless of priority.")))
+                if d["pre_wrap"]:
+                    blocks = fn_groups([(shown, [who], [me], (), "", d["blob_of"].get(shown))
+                                        for shown, who in d["pre_wrap"]], tip_prio)
+                    reps = list(dict.fromkeys(who for _shown, who in d["pre_wrap"]))
+                    rep_name = reps[0] if len(reps) == 1 else "Another mod"
+                    attach((1, tip_section(f"Add-on skipped · {len(d['pre_wrap'])}", "bronze_hi", blocks,
+                                                f"{rep_name} replaces this function completely, so this mod's addition "
+                                                "to it never runs. Give this mod the higher priority and both will work.")))
             def note(r):
                 bits = []
                 if r.get("shared"):
@@ -19801,36 +26856,50 @@ class MainWindow(RememberSize, QMainWindow):
             if auto or manual:
                 chips.append((f"✓ {len(auto) + len(manual)}", "ok"))  # merged, on its own or with your answers
             if auto:
-                attach((2, tip_section("Merged", "moss", scripts(auto, note))))
+                attach((2, tip_section(f"Merged · {len(auto)}", "moss", scripts(auto, note, True, True))))
             if manual:
-                attach((2, tip_section("Merged with your decisions", "moss", scripts(manual, note),
+                attach((2, tip_section(f"Merged with your decisions · {len(manual)}", "moss", scripts(manual, note, True, True),
                                             "To change them: Right-click → Script decisions…")))
             if mg["nobase"]:
                 n = len(mg["nobase"])
                 chips.append((f"≠ {n}", "warn"))                      # different copies of a new script
-                attach((1, tip_section("Different copies of a new script", "bronze_hi",
+                attach((1, tip_section(f"Different copies of a new script · {n}", "bronze_hi",
                                             file_groups([(r["rel"], mods_of(r), "") for r in mg["nobase"]], prio=tip_prio, win=win_map,
                                                         me=m["name"], winner=True),
-                                            "Not a game script, so it can't be merged. The bold one is used; click "
+                                            "Not a game script, so it can't be merged. The blue one is used; click "
                                             "another to make it win. Best give the newest one the win.")))
+            # most of its files overridden by higher priority mods: keeping it does little
+            f_lost = d.get("lost", 0) + sum(1 for k, v in d["packed"].items() if not v["wins"] and not k.startswith(TEXT_ID))
+            f_total = d.get("file_total", 0) + d.get("packed_total", 0)
+            f_warn = None
+            if f_total and f_lost * 2 > f_total:
+                f_warn = tip_section(f"Fully overridden · all {f_total} files" if f_lost >= f_total
+                                     else f"Mostly overridden · {f_lost} of {f_total} files", "bronze_hi", [],
+                                     ("None of its files are used, so keeping it does nothing."
+                                      if f_lost >= f_total else
+                                      "Higher priority mods' copies are used instead, so keeping it does little.")
+                                     + " Better to remove one of them.")
             if d["packed"]:
                 # texts (.w3strings) clash by string ID: all of them are one line with a count, since
                 # every one has the same answer (the higher priority's text is used)
                 texts = [k for k in d["packed"] if k.startswith(TEXT_ID)]
                 n = len(d["packed"]) - len(texts) + (1 if texts else 0)
                 chips.append((f"⚠ {n}", "warn"))                      # packed files clash
+                if f_warn and any(not v["wins"] for v in d["packed"].values()):
+                    attach((0, f_warn))                               # said first, in this chip
+                    f_warn = None
                 blocks = file_groups([(k, v["order"], "", "Texts (.w3strings)" if k.startswith(TEXT_ID) else "")
                                       for k, v in d["packed"].items()], prio=tip_prio, win=win_map, me=m["name"], winner=True,
                                      totals=d.get("packed_totals"))
-                attach((1, tip_section("Clashes", "bronze_hi", blocks,
-                                            "The bold one is used. Click another to make it win.")))
+                attach((1, tip_section(f"Clashes · {n}", "bronze_hi", blocks,
+                                            "The blue one is used. Click another to make it win.")))
             if d["xmls"]:
                 n = len(d["xmls"])
                 chips.append((f"☰ {n}", "bad"))                       # menu xml clashes
-                attach((0, tip_section("Menu xml clash", "blood",
+                attach((0, tip_section(f"Menu xml clash · {n}", "blood",
                                             file_groups([(k, v, "") for k, v in d["xmls"].items()], prio=tip_prio, win=win_map,
                                                         me=m["name"], winner=True),
-                                            "Only the bold one is used, so some menu options may be missing. "
+                                            "Only the blue one is used, so some menu options may be missing. "
                                             "Click another to make it win.")))
             # made for another game version: its copies of game files come from an older (or newer)
             # patch than yours
@@ -19884,15 +26953,23 @@ class MainWindow(RememberSize, QMainWindow):
                 chips.append(("⊘", "bad-line"))                        # gone from Nexus
                 attach((0, tip_section("Gone from Nexus", "blood", [],
                                             "Keep your archive. You may not get it again.")))
+            elif rem and self.mgr.page_ahead(m):
+                # the page is at a newer version, but which file is yours can't be told: said, not offered
+                chips.append(("↑", "new-line"))
+                attach((1, tip_section("Newer version on Nexus", "sky",
+                                       [html.escape(f"You have {m.get('version') or '?'}  ·  The page says {self.mgr.page_ahead(m)}")
+                                        + f"<br><span style='color:{C['ash']}'>Nexus doesn't say which file it is. "
+                                          "Check the mod's files on Nexus.</span>"])))
             elif rem and self.mgr.update_waiting(m):         # one you chose to skip stays hidden
                 chips.append(("↑", "new"))                             # update on Nexus
                 attach((1, tip_section("Update on Nexus", "sky",
                                             [html.escape(f"You have {m.get('version') or '?'}  ·  Nexus has {rem['version']}"
                                                          + (" (uploaded again)" if clean_version(rem["version"]) == clean_version(m.get("version")) else ""))
                                              + (f"<br><span style='color:{C['ash']}'>File: {html.escape(rem['file'])}</span>"
-                                                if rem.get("file") else "")] + self._changelog_blocks(m, rem),
-                                            "Right-click → Open Nexus page. Version names don't always "
-                                            "match, so check first.")))
+                                                if rem.get("file") else "")
+                                             + (f"<br><span style='color:{C['ash']}'>Your file is no longer on Nexus. This is the "
+                                                "mod's main file now.</span>" if rem.get("successor") else "")]
+                                            + self._changelog_blocks(m, rem))))
             # what its instructions put in the game's settings files: one chip, one tooltip —
             # problems first, then what went in, then what's switched off
             sections, state = [], None
@@ -19924,6 +27001,17 @@ class MainWindow(RememberSize, QMainWindow):
                 sections.append(tip_section(" and ".join(w for w, _r in wait) + " waiting", "bronze_hi", [],
                                             " ".join(reasons)))
             added = []
+            if d.get("preset"):
+                how, what = d["preset"]
+                if how == "in":
+                    sections.append(tip_section(f"Keybind preset · {what}", "moss", [f"{plural(what, 'section')} of input.settings"],
+                                                "Yours come back when it's off or removed, unless you changed one since."))
+                elif how == "other":
+                    sections.append(tip_section("Keybind preset not used", "ash", [html.escape(what)],
+                                                "This one's preset is used: it has the higher priority."))
+                else:
+                    state = state or "wait"
+                    sections.append(tip_section("Keybind preset waiting", "bronze_hi", [], what))
             if d["keys_added"]:
                 added.append(f"{plural(d['keys_added'], 'keybind')} in input.settings")
             if d.get("settings_added"):
@@ -19935,7 +27023,7 @@ class MainWindow(RememberSize, QMainWindow):
                 # every line it added, by file and section: [Section] in grey, then key=value
                 blocks = []
                 for file, entries in (d.get("added_lines") or {}).items():
-                    rows_, last = [f"<span style='color:{C['silver']}'>{html.escape(file)}</span>"], None
+                    rows_, last = [], None
                     for section, line in entries:
                         if section and section != last:
                             rows_.append(f"<span style='color:{C['ash']}'>[{html.escape(section)}]</span>")
@@ -19943,12 +27031,15 @@ class MainWindow(RememberSize, QMainWindow):
                         key, eq, value = line.partition("=")
                         rows_.append(f"<span style='color:{C['steel']}'>{html.escape(key)}</span>"
                                      + (f"={html.escape(value)}" if eq else ""))
-                    blocks.append("<br>".join(rows_))
-                sections.append(tip_section("Added", "moss", blocks or ["<br>".join(html.escape(x) for x in added)],
+                    # the file's name, then a little apart its sections and lines
+                    blocks.append(f"<p style='margin:10px 0 0 0'><span style='color:{C['silver']}'>{html.escape(file)}</span></p>"
+                                  f"<p style='margin:6px 0 0 0'>{'<br>'.join(rows_)}</p>")
+                sections.append(tip_section(f"Added · {d['keys_added'] + d.get('settings_added', 0) + d.get('xml_added', 0)}", "moss", blocks or ["<br>".join(html.escape(x) for x in added)],
                                             "Values you already had stay. Taken out when the mod is off or removed."
                                             + (f" From {src}." if src else "")))
             if d.get("settings_off"):
-                names = {"user": "user.settings", "input": "input.settings", "input_xml": "input.xml"}
+                names = {"user": "user.settings", "input": "input.settings", "input_xml": "input.xml",
+                         "input_preset": "input.settings (keybind preset)"}
                 sections.append(tip_section("Not added", "ash",
                                             [html.escape(" · ".join(names[k] for k in d["settings_off"]))],
                                             "Switched off. Right-click → Edit… to add them."))
@@ -19959,22 +27050,26 @@ class MainWindow(RememberSize, QMainWindow):
                                             "Its value has a : in it. The game can't read that and may reset "
                                             "all settings over it."))
             if sections:
-                n = d["keys_added"] + d.get("settings_added", 0) + d.get("xml_added", 0)
+                n = d["keys_added"] + d.get("settings_added", 0) + d.get("xml_added", 0) \
+                    + (d["preset"][1] if d.get("preset") and d["preset"][0] == "in" else 0)
                 if state == "clash":
-                    chip = ("⚙ !", "bad")
+                    chip = ("≡ !", "bad")
                 elif state in ("hand", "wait"):
-                    chip = (f"⚙ {n}" if n else ("⚙ ?" if state == "hand" else "⚙ …"), "warn")
+                    chip = (f"≡ {n}" if n else ("≡ ?" if state == "hand" else "≡ …"), "warn")
                 elif n:
-                    chip = (f"⚙ {n}", "ok")
+                    chip = (f"≡ {n}", "ok")
                 else:
-                    chip = ("⚙ off", "files")
+                    chip = ("≡ off", "files")
                 chips.append(chip)
                 for sec in sections:
                     attach((0, sec))
             if d["lost"]:
                 n = d["lost"]
-                chips.append((f"⧉ {n}", "files"))                     # files overridden by higher mods
-                attach((3, tip_section("Files overridden", "ash",
+                chips.append((f"⧉ {n}", "warn" if f_warn else "files"))   # files overridden by higher mods
+                if f_warn:
+                    attach((0, f_warn))
+                    f_warn = None
+                attach((3, tip_section(f"Files overridden · {n}", "ash",
                                             [html.escape(f"{n} of its files are replaced by mods with a higher priority")])))
             prio_rows = rows.get(m["id"], []) if m["enabled"] else []
             it = QTreeWidgetItem([
@@ -19983,20 +27078,28 @@ class MainWindow(RememberSize, QMainWindow):
             ])
             it.setData(0, Qt.ItemDataRole.UserRole, m["id"])
             it.setData(PRIORITY_COL, OFF_ROLE, not m["enabled"])
+            if not self.cfg.get("chip_counts"):
+                # just the icon: the count is in its tooltip's title (Settings → Show counts)
+                chips = [(CHIP_COUNT.sub(r"\1", c[0]), *c[1:]) for c in chips]
             it.setData(CONFLICT_COL, CHIPS_ROLE, chips)
             it.setFlags((it.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEditable
                          | Qt.ItemFlag.ItemIsDragEnabled) & ~Qt.ItemFlag.ItemIsDropEnabled)
             it.setCheckState(NAME_COL, Qt.CheckState.Checked if m["enabled"] else Qt.CheckState.Unchecked)
             it.setData(NAME_COL, GROUP_ROLE, self._link_groups.get(m["id"]))
+            it.setData(NAME_COL, MARK_ROLE, m["id"] in marked)
             menus = self.mgr.menu_files(m)
-            it.setData(NAME_COL, MENU_ROLE, menu_tip(menus, m["enabled"], "menu" in (m.get("snippets_off") or ()))
+            it.setData(NAME_COL, MENU_ROLE, menu_tip(menus, m["enabled"], "menu" in (m.get("snippets_off") or ()),
+                                                     bool(m.get("menu_hidden")))
                        if menus else None)
+            it.setData(NAME_COL, MENU_HIDDEN_ROLE, bool(menus and m.get("menu_hidden")))
             it.setToolTip(PRIORITY_COL, priority_tip(m, prio_rows, bool(self.mgr.prefix),
                                                      shared_of.get(m["id"], ()) if m["enabled"] else (), legacy_on,
-                                                     self._blob_peers(m, rows) if m["enabled"] else None))
+                                                     self._blob_peers(m, rows) if m["enabled"] else None,
+                                                     self.mgr.script_links_of(m) if m["enabled"] else None))
             made = made_for.get(m["id"])
-            it.setToolTip(NAME_COL, "<b>Installs to</b>" + TIP_RULE + "<br>".join(
-                targets_html(t) for t in m["targets"])
+            it.setToolTip(NAME_COL, ("<b>Installs to</b>" + TIP_RULE + "<br>".join(targets_html(t) for t in m["targets"])
+                                     if m["targets"] else "<b>Nothing in the game folder</b>" + TIP_RULE
+                                     + f"<span style='color:{C['ash']}'>It only changes your settings files.</span>")
                 + (f"{TIP_RULE}<span style='color:{C['ash']}'>Game version: {html.escape(made['label'])} "
                    + ("(from its copies of game files)" if made["files"] else
                       "(its mod info file)" if made.get("declared") and made["label"] == ", ".join(made["declared"][:2])
@@ -20019,6 +27122,7 @@ class MainWindow(RememberSize, QMainWindow):
         self._update_headers(rows)
         self.tree.refresh_counts()
         self._populating = False
+        self._fresh_armed = {i for i in self._fresh_armed if i in {m["id"] for m in self.mgr.mods}}
         self.apply_filter()
         self.empty.setVisible(not self.mgr.mods)
         self.empty.resize(self.tree.viewport().size())
@@ -20086,7 +27190,10 @@ class MainWindow(RememberSize, QMainWindow):
         to Nexus's, newest first. Fetched with the update check; nothing when it wasn't."""
         page = self.mgr.state.get("nexus_cache", {}).get(str(m.get("nexus") or "")) or {}
         if "changelog_for" not in page:
-            return []
+            # an update found without a check (worked out from what was fetched before): its
+            # changelog comes with the next one
+            return [f"<p style='margin:10px 0 0 0'><span style='color:{C['ash']}'>The changelog comes with the next "
+                    "update check</span></p>"]
         rows = changelog_between(page.get("changelog"), m.get("version"), rem.get("version"))
         if not rows:
             return [f"<span style='color:{C['ash']}'>No changelog on Nexus for these versions</span>"]
@@ -20095,7 +27202,7 @@ class MainWindow(RememberSize, QMainWindow):
             # each line its own paragraph, hanging under its dot when it wraps
             blocks.append(f"<p style='margin:10px 0 0 0'><span style='color:{C['silver']}'><b>"
                           f"{html.escape(version_label(ver))}</b></span></p>"
-                          + "".join(f"<p style='margin:2px 0 0 12px; text-indent:-10px'><span style='color:{C['steel']}'>·</span>"
+                          + "".join(f"<p style='margin:2px 0 0 14px; text-indent:-14px'><span style='color:{C['steel']}'>•</span>"
                                     f"&nbsp;{html.escape(l)}</p>" for l in lines))
         return blocks
 
@@ -20113,6 +27220,10 @@ class MainWindow(RememberSize, QMainWindow):
                      | Qt.ItemFlag.ItemIsDragEnabled) & ~Qt.ItemFlag.ItemIsDropEnabled)
         if HEAD_LOOK == "bronze":
             it.setForeground(NAME_COL, QBrush(QColor(C["bronze_hi"])))
+        elif HEAD_LOOK == "bold":
+            f = QFont(self.tree.font())
+            f.setBold(True)
+            it.setFont(NAME_COL, f)
         it.setForeground(DATE_COL, QBrush(QColor(C["ash"])))
         it.setTextAlignment(DATE_COL, int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter))
         it.setToolTip(NAME_COL, "A group. The checkbox switches all its mods, the arrow folds it. "
@@ -20321,6 +27432,8 @@ class MainWindow(RememberSize, QMainWindow):
         legacy_on = self.mgr.legacy_on()
         was = self._populating
         self._populating = True
+        marked = self.mgr.marked()
+        self._show_all_off()                             # the menu entry follows the marks
         try:
             for i in range(self.tree.topLevelItemCount()):
                 it = self.tree.topLevelItem(i)
@@ -20332,11 +27445,15 @@ class MainWindow(RememberSize, QMainWindow):
                 prio_rows = rows.get(m["id"], []) if m["enabled"] else []
                 it.setText(PRIORITY_COL, prio_label(prio_rows) if prio_rows else "–")
                 it.setData(PRIORITY_COL, OFF_ROLE, not m["enabled"])
+                it.setData(NAME_COL, MARK_ROLE, m["id"] in marked)
                 if it.data(NAME_COL, MENU_ROLE):                # its menu sign's "switched off" line follows
-                    it.setData(NAME_COL, MENU_ROLE, menu_tip(self.mgr.menu_files(m), m["enabled"], "menu" in (m.get("snippets_off") or ())))
+                    it.setData(NAME_COL, MENU_ROLE, menu_tip(self.mgr.menu_files(m), m["enabled"], "menu" in (m.get("snippets_off") or ()),
+                                                             bool(m.get("menu_hidden"))))
+                    it.setData(NAME_COL, MENU_HIDDEN_ROLE, bool(m.get("menu_hidden")))
                 it.setToolTip(PRIORITY_COL, priority_tip(m, prio_rows, bool(self.mgr.prefix),
                                                          shared_of.get(m["id"], ()) if m["enabled"] else (), legacy_on,
-                                                         self._blob_peers(m, rows) if m["enabled"] else None))
+                                                         self._blob_peers(m, rows) if m["enabled"] else None,
+                                                         self.mgr.script_links_of(m) if m["enabled"] else None))
         finally:
             self._populating = was
         self._update_headers(rows)                        # a header's count, checkbox and numbers
@@ -20355,6 +27472,31 @@ class MainWindow(RememberSize, QMainWindow):
                 if hit and hit[1] != m["id"]:
                     out.setdefault(m["id"], []).append((hit[0], self.mgr.get(hit[1])["name"], prio_label(rows[hit[1]])))
         return out
+
+    def view_blob(self, mid, cls="", fn=""):
+        """A mod's precompiled scripts, decompiled, in their own window: at a function when one's given."""
+        src = self.mgr.blob_source(mid) if self.mgr else None
+        if src is None:
+            self.status.say("Its precompiled scripts couldn't be read.", "")
+            return
+        dlg = BlobScriptDialog(self, src, (cls, fn) if fn else None)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dlg.show()
+
+    def view_merged(self, key):
+        """A merged file from a tooltip: its own window, whole, the merge picked out. A function from
+        a precompiled mod ("blob", mod, class, function): that mod's own version of it."""
+        if isinstance(key, tuple) and key and key[0] == "blob":
+            self.view_blob(*key[1:])
+            return
+        view = self.mgr.merged_view(key) if self.mgr else None
+        if view is None:
+            self.status.say("That file isn't merged anymore.", "")
+            return
+        decide = (lambda: QTimer.singleShot(0, lambda: self.open_resolver([key]))) if view["decided"] else None
+        dlg = MergedScriptDialog(self, view, decide)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dlg.show()
 
     def make_win(self, mid, over):
         """A mod's name clicked in a clash tooltip: it trades priority numbers with the mod whose
@@ -20497,6 +27639,8 @@ class MainWindow(RememberSize, QMainWindow):
             font = QFont(edit.font())
             font.setBold(True)
             edit.setFont(font)
+            if self.mgr.menu_files(m):
+                menu.addAction("Mod settings…", lambda: self.open_menu_settings(mid))
             menu.addSeparator()
             # open: readme, Nexus page, folder
             docs = self.mgr.mod_docs(m)
@@ -20522,6 +27666,8 @@ class MainWindow(RememberSize, QMainWindow):
             if m.get("nexus"):
                 menu.addAction("Open Nexus page", lambda: QDesktopServices.openUrl(QUrl(NEXUS_URL.format(m["nexus"]))))
             menu.addAction("Open folder", lambda: self.open_path(self.mgr.stage_dir(m)))
+            if any(t.lower().startswith("mods/") and folder_has_rsblob(self.mgr.stage_dir(m) / t) for t in m["targets"]):
+                menu.addAction("Precompiled scripts…", lambda: self.view_blob(mid))
             # decisions: only when it has some
             menu.addSeparator()
             mine = [k for k, r in self.mgr.state.get("merges", {}).items()
@@ -20539,6 +27685,9 @@ class MainWindow(RememberSize, QMainWindow):
         offered = [(c, self.mgr.remote_for(c).get("version")) for c in chosen]
         offered = [(c, v) for c, v in offered if v and (self.mgr.remote_for(c)["newer"] if "newer" in self.mgr.remote_for(c)
                                                         else version_is_newer(v, c.get("version")))]
+        have = {id(c) for c, _v in offered}
+        offered += [(c, v) for c in chosen if id(c) not in have
+                    for v in [self.mgr.page_ahead(c, skipped_too=True)] if v]       # a newer page version too
         waiting = [(c, v) for c, v in offered if clean_version(v) != clean_version(c.get("skip_update"))]
         skipped = [(c, v) for c, v in offered if clean_version(v) == clean_version(c.get("skip_update"))]
         if waiting:
@@ -20585,6 +27734,23 @@ class MainWindow(RememberSize, QMainWindow):
             return
         fn(arg)
         self.refresh()
+
+    def open_menu_settings(self, mid):
+        """A mod's in-game menu settings, in their own window (its menu sign clicked, or Mod settings…)."""
+        m = self.mgr.get(mid)
+        if not m or self._busy:
+            return
+        if not self.mgr.menu_model(mid):
+            self.status.say(f"Couldn't read {m['name']}'s menu file")
+            return
+        dlg = MenuSettingsDialog(self, self.mgr, mid)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            if dlg.hide_changed():
+                self.refresh()
+                self.resync()                        # its menu file placed again, hidden or not
+                self.status.say(f"{m['name']}'s menu {'hidden from' if m.get('menu_hidden') else 'shown in'} the game")
+            else:
+                self.status.say(f"Saved {m['name']}'s settings")
 
     def edit_mod(self, mid):
         """The Edit window for one mod: its details, instruction settings and files."""
@@ -20635,6 +27801,73 @@ class MainWindow(RememberSize, QMainWindow):
                 QTimer.singleShot(0, lambda: self.open_resolver(waiting))
         self.run_task("Clearing decisions…", self.mgr.clear_decisions, mid, on_done=done)
 
+    def _fresh_selection(self):
+        """A just-installed mod selected again (after being deselected once) is no longer new.
+        The Downloads panel shows where the selected mod's download is."""
+        if self._populating or not self.mgr:
+            return
+        chosen_mods = [m for m in (self.mgr.get(it.data(0, Qt.ItemDataRole.UserRole)) for it in self.tree.selectedItems()) if m]
+        self.downloads.link_mods(chosen_mods)
+        fresh = {m["id"] for m in self.mgr.mods if m.get("fresh")}
+        if not fresh:
+            return
+        chosen = {it.data(0, Qt.ItemDataRole.UserRole) for it in self.tree.selectedItems()}
+        seen = (fresh & chosen) & self._fresh_armed
+        self._fresh_armed |= fresh - chosen
+        if seen:
+            self._fresh_armed -= seen
+            self.mgr.clear_fresh(seen)
+            self._mark_fresh()
+
+    def _mark_fresh(self):
+        """The sections' bronze edges again, without rebuilding the list."""
+        fresh = self.mgr.fresh_sections() if self.mgr else set()
+        was, self._populating = self._populating, True      # not an edit of yours (see on_item_changed)
+        try:
+            for k in range(self.tree.topLevelItemCount()):
+                it = self.tree.topLevelItem(k)
+                if it.data(0, SEP_ROLE):
+                    it.setData(0, FRESH_ROLE, it.data(0, Qt.ItemDataRole.UserRole) in fresh)
+        finally:
+            self._populating = was
+        self.tree.viewport().update()
+
+    def merge_again(self):
+        """Everything merged made again from scratch: see ModManager.merge_again."""
+        if not self.mgr:
+            return
+        if game_running():
+            self.status.say("Close the game first", "Merges can't be made again while the game is running.")
+            return
+        if self.mgr.all_off():
+            self.status.say("Mods are off", "Turn mods back on first: nothing is merged while they're off.")
+            return
+
+        box = QMessageBox(QMessageBox.Icon.Question, "Merge again",
+                          "Everything merged is built again from your mods.\n\n"
+                          "Decide again: your Script decisions are asked again.\n"
+                          "Keep decisions: your answers are used again.\n\n"
+                          "Values you changed in merged .ini files stay.", parent=self)
+        again = box.addButton("Decide again", QMessageBox.ButtonRole.AcceptRole)
+        again.setObjectName("Primary")
+        again.style().unpolish(again)
+        again.style().polish(again)
+        keep = box.addButton("Keep decisions", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(again)
+        box.exec()
+        if box.clickedButton() not in (again, keep):
+            return
+        forget = box.clickedButton() is again
+
+        def done(n):
+            pending = self.mgr.pending_merges()
+            self.status.say(f"Merged again: {n} file{'s' * (n != 1)}" + (", decisions needed" if pending else ""),
+                            "Built again from your mods." + ("" if forget else " Your decisions were used again."))
+            if forget and pending:
+                QTimer.singleShot(0, lambda: self.open_resolver(pending))
+        self.run_task("Merging again…", self.mgr.merge_again, forget, on_done=done)
+
     def ask_resolve(self, keys):
         n = sum(self.mgr.state["merges"][k].get("pending", 0) for k in keys)
         box = QMessageBox(QMessageBox.Icon.Question, "Script decisions",
@@ -20682,42 +27915,22 @@ class MainWindow(RememberSize, QMainWindow):
                   + "\n\n") + names)
         if r != QMessageBox.StandardButton.Yes:
             return
-        strays = self.mgr.stray_files({i for i in ids if not (self.mgr.get(i) or {}).get("sep")})
-        if strays:
-            folders = sorted({"/".join(x.split("/")[:2]) for x in strays}, key=str.lower)
-            box = DetailsBox(QMessageBox.Icon.Question, "Files the app didn't put there", "", parent=self)
-            box.setTextFormat(Qt.TextFormat.RichText)
-            n = len(strays)
-            listed = n <= 20                                # a long list goes under Show Details, whole
-            # each folder, then its files inside it (shorter than full paths, and no path broken in two)
-            parts = []
-            for folder in folders:
-                inside = [x[len(folder) + 1:] for x in strays if x.lower().startswith(folder.lower() + "/")]
-                parts.append(f"<b>{html.escape(folder)}</b>" + "".join(
-                    f"<br><span style='color:{C['ash']};'><nobr>&nbsp;&nbsp;{html.escape(x)}</nobr></span>" for x in inside))
-            box.setText(f"{'These' if n != 1 else 'This'} {n} file{'s' if n != 1 else ''} in "
-                        + ("this mod's folder" if len(folders) == 1 else "these mods' folders")
-                        + f" {'weren' if n != 1 else 'wasn'}'t put there by the app. The mod's tools made "
-                        f"{'them' if n != 1 else 'it'}, or you did."
-                        + ("<br><br>" + "<br><br>".join(parts) if listed
-                           else "<br><br>" + "<br>".join(f"<b>{html.escape(f)}</b>" for f in folders)
-                           + "<br><br>The list is under Show Details.")
-                        + "<br><br>Remove them too? They go to the Trash.")
-            if not listed:
-                box.setDetailedText("\n".join(strays))
-            drop = box.addButton("Remove them too", QMessageBox.ButtonRole.AcceptRole)
-            keep = box.addButton("Keep them", QMessageBox.ButtonRole.RejectRole)
-            keep.setObjectName("Primary")                   # the safe choice, and the default
-            keep.style().unpolish(keep)
-            keep.style().polish(keep)
-            box.setDefaultButton(keep)
-            box.exec()
-            if box.clickedButton() is not drop:
-                strays = []
+        found = self.mgr.stray_candidates({i for i in ids if not (self.mgr.get(i) or {}).get("sep")})
+        strays = []
+        if found:
+            dlg = StrayFilesDialog(self, found)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                strays = dlg.ticked()
         self.run_task("Removing…" if only_seps else "Uninstalling…", self.mgr.remove_rows, set(ids), strays)
 
     def run_merger(self):
         """Script Merger is a Windows app — run it in the game's own prefix through Wine."""
+        if getattr(self, "_merger", None) is not None and self._merger.state() != QProcess.ProcessState.NotRunning:
+            self.status.say("Script Merger is already running")
+            return
+        if getattr(self, "_merger_closing", False):
+            self.status.say("Script Merger is still closing", "Wine is closing behind it. Try again in a moment.")
+            return
         path = Path(self.cfg.get("merger_path", ""))
         if not path.is_file():
             box = QMessageBox(QMessageBox.Icon.Information, "Script Merger",
@@ -20739,8 +27952,67 @@ class MainWindow(RememberSize, QMainWindow):
                                 "Script Merger is a Windows app and needs Wine:\n\n"
                                 "sudo dnf install wine")
             return
+        if game_running():
+            self.status.say("Close the game first", "Script Merger runs in the game's prefix.")
+            return
         if not self.fix_merger_paths(path):
             return
+        # Script Merger doesn't scale itself: Wine draws it at the prefix's DPI, 96 (100%) unless
+        # set. While it runs, the prefix gets the DPI of the screen this window is on; afterwards
+        # (or at the next start, if the app was closed first) the prefix gets its own value back
+        dpi = round(96 * self.devicePixelRatioF())
+        if dpi <= 96:
+            self._launch_merger(exe, path)
+            return
+
+        prefix = str(self.mgr.prefix)
+        launch = lambda *_a: self._launch_merger(exe, path)
+        old = prefix_logpixels(prefix)                   # read from the file: no Wine started for it
+        if old is False:
+            old = None if not (Path(prefix) / "drive_c").is_dir() else wine_logpixels(exe, prefix)
+        if old == dpi:
+            launch()                                     # already right (left from a run cut short)
+            return
+        # its own value is written down before anything changes, so it can always go back
+        pending = self.cfg.get("merger_dpi_restore")
+        if not (pending and pending.get("prefix") == prefix):
+            self.cfg["merger_dpi_restore"] = {"prefix": prefix, "value": old}
+            save_config(self.cfg)
+        self.status.say("Starting Script Merger…")
+        self._background(wine_set_logpixels, exe, prefix, dpi, done=launch, failed=launch)
+
+    def _background(self, fn, *args, done=None, failed=None):
+        """fn(*args) off the main thread, without the busy state and the list redraw of run_task
+        (nothing in the mod list changes): done(result) or failed(message) on the main thread."""
+        worker = Worker(fn, *args)
+        self._workers.append(worker)
+        if done:
+            worker.done.connect(done)
+        if failed:
+            worker.failed.connect(failed)
+        worker.finished.connect(lambda: self._workers.remove(worker) if worker in self._workers else None)
+        worker.start()
+
+    def restore_merger_dpi(self, then=None):
+        """The prefix's own DPI back, after Script Merger ran with the screen's (see run_merger).
+        then(): called afterwards either way."""
+        pending = self.cfg.get("merger_dpi_restore")
+        exe = shutil.which("wine") or shutil.which("wine64")
+        if not pending or not exe or game_running():
+            if then:
+                then()
+            return
+
+        def done(ok):
+            if ok:
+                self.cfg.pop("merger_dpi_restore", None)
+                save_config(self.cfg)
+            if then:
+                then()
+        self._background(wine_set_logpixels, exe, pending["prefix"], pending.get("value"), done=done,
+                         failed=lambda _m: then() if then else None)
+
+    def _launch_merger(self, exe, path):
         env = QProcessEnvironment.systemEnvironment()
         env.insert("WINEPREFIX", str(self.mgr.prefix))
         env.insert("WINEDEBUG", "-all")
@@ -20751,6 +28023,7 @@ class MainWindow(RememberSize, QMainWindow):
         def failed(_e):
             self.status.setText("Couldn't start Wine. Check Settings.")
             self.act_merger.setEnabled(True)
+            self.restore_merger_dpi()
         self._merger.errorOccurred.connect(failed)
         self._merger.start(exe, [str(path)])
         self.act_merger.setEnabled(False)
@@ -20818,9 +28091,18 @@ class MainWindow(RememberSize, QMainWindow):
                 return
 
     def merger_done(self, *_args):
-        self.act_merger.setEnabled(True)
-        self.status.setText("Script Merger closed, rechecking")
-        self.resync()
+        """Its window is gone, but Wine takes a few more seconds to close behind it, and a second
+        Script Merger started in that time fails: it can be started again once Wine has closed."""
+        self.status.say("Script Merger closing…", "Wine is still closing behind it. It can be started again in a moment.")
+        prefix = str(self.mgr.prefix) if self.mgr else ""
+
+        def closed(*_a):
+            self._merger_closing = False
+            self.act_merger.setEnabled(True)
+            self.status.setText("Script Merger closed, rechecking")
+            self.resync()
+        self._merger_closing = True
+        self.restore_merger_dpi(then=lambda: self._background(wine_wait_closed, prefix, done=closed, failed=closed))
 
     def show_limits(self):
         text, tip = limits_text()
@@ -20885,7 +28167,11 @@ class MainWindow(RememberSize, QMainWindow):
 
     def updates_done(self, res, without, only=None):
         self.show_limits()
-        bits, notes = [f"Checked {res['checked']}"], []
+        # counted in mods, as the list shows them: mods from one Nexus page share one check
+        pool = [m for m in self.mgr.mods if only is None or m["id"] in only]
+        on = lambda key: sum(1 for m in pool if str(m.get("nexus") or "") in set(res.get(key) or ()))
+        asked, same, left = on("pages_asked"), on("pages_same"), on("pages_left")
+        bits, notes = [f"Checked {asked + same}"], []
         found = [(m, self.mgr.update_waiting(m)) for m in self.mgr.mods if only is None or m["id"] in only]
         found = [(m, v) for m, v in found if v]
         bits.append(f"{len(found)} update{'s' if len(found) != 1 else ''}" if found else "no updates")
@@ -20893,14 +28179,14 @@ class MainWindow(RememberSize, QMainWindow):
             notes.append("\n".join(f"{m['name']}: {m.get('version') or '?'} → {v}"
                                    + (" (uploaded again)" if clean_version(v) == clean_version(m.get("version")) else "")
                                    for m, v in found))
-        if res.get("unchanged"):
-            notes.append(f"{res['asked']} changed on Nexus since the last check and {'were' if res['asked'] != 1 else 'was'} "
-                         f"checked again. The other {res['unchanged']} didn't change.")
+        if same:
+            notes.append(f"{asked} changed on Nexus since the last check and {'were' if asked != 1 else 'was'} "
+                         f"checked again. The other {same} didn't change.")
         if res.get("offline"):
-            bits.append(f"Nexus stopped answering, {res['left']} left" if res["left"] else "Nexus stopped answering")
+            bits.append(f"Nexus stopped answering, {left} left" if left else "Nexus stopped answering")
             notes.append(f"{res['offline']} The check stopped, keeping what it found. Try again later for the rest.")
         elif res["capped"]:
-            bits.append(f"{res['left']} left (hourly limit)")
+            bits.append(f"{left} left (hourly limit)")
             notes.append("Paused at the Nexus hourly limit. Try again later.")
         if without:
             bits.append(f"{len(without)} without Nexus ID")
@@ -21046,10 +28332,15 @@ class MainWindow(RememberSize, QMainWindow):
         if done is None:
             done = self._installed_now = []
         done.append(mid)
+        self.select_mods(done)
+
+    def select_mods(self, ids):
+        """Select these mods in the list and scroll to them, opening a folded section and clearing
+        the filter if it hides them; the last one in view."""
         tree = self.tree
         items = {tree.topLevelItem(i).data(0, Qt.ItemDataRole.UserRole): tree.topLevelItem(i)
                  for i in range(tree.topLevelItemCount())}
-        wanted = [items[i] for i in done if i in items]
+        wanted = [items[i] for i in ids if i in items]
         if not wanted:
             return
         if self.search.text() and any(it.isHidden() for it in wanted):
@@ -21170,10 +28461,20 @@ class MainWindow(RememberSize, QMainWindow):
             olds = [self.mgr.get(i) for i in managed]
             # a different file (another family from the same page, or another Nexus mod) that
             # installs into the same folder is a patch or add-on for it, not a new version
-            other = all(not self.mgr.same_file_line(o, nexus_id, (defaults or {}).get("file"), Path(path).name)
-                        and ((fam and file_family(o.get("archive")) and file_family(o.get("archive")) != fam)
-                             or (o.get("nexus") and nexus_id and str(o["nexus"]) != str(nexus_id))) for o in olds)
-            if other:
+            is_other = lambda o: (not self.mgr.same_file_line(o, nexus_id, (defaults or {}).get("file"), Path(path).name)
+                                  and ((fam and file_family(o.get("archive")) and file_family(o.get("archive")) != fam)
+                                       or (o.get("nexus") and nexus_id and str(o["nexus"]) != str(nexus_id))))
+            other = all(is_other(o) for o in olds)
+            if not other and any(is_other(o) for o in olds):
+                # a new version of one mod, sharing its folder with an add-on from another file
+                # (Music Plus and its music pack): that one replaced, the add-on left alone
+                olds = [o for o in olds if not is_other(o)]
+                managed = [o["id"] for o in olds]
+            old_dirs = {t.lower() for t in (old or {}).get("targets", ()) if "/" in t}
+            if other and old and all(old_dirs & {t.lower() for t in o["targets"]} for o in olds):
+                # updating a mod whose add-ons already share its folder: they stay alongside, as before
+                choice, managed = "alongside", []
+            elif other:
                 choice = self._confirm_shared(olds, display, planned_targets(plan))
                 if choice == "alongside":
                     above = min(olds, key=lambda o: self.mgr.rows.index(o))["id"]
@@ -21284,7 +28585,9 @@ class MainWindow(RememberSize, QMainWindow):
                 return False                         # a renamed version of its file, by Nexus's record
             return bool((fam and file_family(o.get("archive")) and file_family(o.get("archive")) != fam)
                         or (o.get("nexus") and nexus_id and str(o["nexus"]) != nexus_id))
-        return [] if not olds or any(other(o) for o in olds) else olds
+        # an add-on from another file sharing the folder (Music Plus's music pack) stays as it is:
+        # only the mods this is a new version of are replaced
+        return [o for o in olds if not other(o)]
 
     def _install_verb(self, olds, version, nexus_id=None, file_id=None, file_name=None):
         """What the Install window's button says: Install for a new mod; for one you have, Update
