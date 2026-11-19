@@ -76,12 +76,9 @@ Newest first. Versions match the ones on Nexus. From 1.0 on, fixes raise the las
 ## 0.5b · 2026-10-10
 
 **New**
-- Support for The Witcher 3 Remastered (5.00, 5.01), detected automatically. 1.x and 4.x work as before.
+- Patch 5.01 supported, alongside 5.00.
 - Red and amber chips for mod files that won't work on 5.x.
-- Precompiled scripts (.rsblob) are read, and mods that add or replace the same game function are flagged.
-- Texture, sound and text (.w3strings) clashes are detected and get priority numbers.
 - Mods made for older game versions merge without undoing the game's later changes.
-- "Log in with Nexus" replaces the API key.
 - Turn all mods off and back on in one click, with your mod menu settings kept exactly.
 - Click a mod in a clash tooltip to make it win.
 - Tooltip file lists say what each kind of file is, folded to one line per kind.
@@ -90,7 +87,6 @@ Newest first. Versions match the ones on Nexus. From 1.0 on, fixes raise the las
 - Sections show how many of their mods are on, and "New section above" is in a mod's right-click menu.
 - The app moves itself into the game's `_ModManager` folder and leaves a shortcut where you started it.
 - The launcher sets up PyQt6 by itself when your system doesn't have it.
-- Reads a mod's info file (REDkit's `info.json`) for its name and version.
 - Old archives go to the Trash after an update.
 
 **Improved**
@@ -115,7 +111,6 @@ Newest first. Versions match the ones on Nexus. From 1.0 on, fixes raise the las
 - Quick checkbox clicks were sometimes ignored.
 - The Install window said "Install" for another version of a mod you have.
 - "Add keybinds by hand" showed for readmes without keybind lines.
-- The update check stopped when one mod page was hidden.
 - A placed file you saved in an editor was replaced on every sync.
 - The downloads panel could be dragged narrower than its cards.
 - A hand-installed mod's priority in the list could differ from mods.settings.
@@ -126,26 +121,17 @@ Newest first. Versions match the ones on Nexus. From 1.0 on, fixes raise the las
 
 **The Witcher 3 Remastered (5.00 and 5.01)**
 - The game version is detected by itself: 5.x has UTF-8 scripts and no DX11 build (`bin/x64`). Everything 5.x-specific below applies only there. Going from 4.x to 5.x and back works with mods installed, and removing every mod leaves a clean game on either version.
-- On 5.x, old mods' UTF-16 scripts, XML and CSV go into the game as UTF-8 copies (the mods' own files are never changed), merged files are written in UTF-8, and DX11 files are held back. `dx11filelist.txt` / `dx12filelist.txt` don't exist on 5.x, so they're left out. On 4.x all of this works as before, and coming back to 4.x puts it back.
+- On 5.x, old mods' UTF-16 scripts, XML and CSV go into the game as UTF-8 copies (the mods' own files are never changed), merged files are written in UTF-8, and DX11 files are held back. On 4.x all of this works as before, and coming back to 4.x puts it back.
 - Red chip for files that won't work on 5.x: packed XML/CSV in UTF-16, `.w3strings` in 4.x's format, old SpeedTree files, old `soundspc.cache`, UI files 5.00 changed, or a mod made only of DX11 files. The warning says they use an old format the Remastered no longer reads, as CDPR's support page puts it.
 - A mod whose only old file is its `collision.cache` gets an amber chip and a plain note instead of red. The game most likely ignores the cache, so its collision and physics shapes may be missing, but the rest of the mod works. Classic-game caches (versions 1 and 2) show "1.32" on the chip; next-gen 4.x ones (version 9) are recognised too.
 - Game-version detection knows 4.04b, 5.00b, 5.00c and 5.01, and tells patches apart. A mod made for 5.00 gets the amber "older patch" chip on 5.01. The "in game" chip also covers mods the Remastered made unneeded.
 - Old mods are rebased onto your patch's own game files. A one-time notice explains the changes on the first start with 5.x.
-- The script view colours the new `map<>` and `set<>` types.
-- Note: `dx11filelist.txt` / `dx12filelist.txt` going missing (reported 30 Sep) was the 5.00 update removing them, not the app.
 
 **Reading mod files by their own format, never by dates**
 - `.w3strings` (4.x's UTF-16 layout and 5.00's version 164), `collision.cache` (versions 1, 2, 9 and 11), bundles and precompiled scripts are each read by their own header. Archive dates are never used. Only a mod file's Nexus upload date counts, and without one a file isn't flagged.
 - A mod built with REDkit 5 is taken as made for the Remastered, so its other files are never called old.
 - Bundles built with REDkit use a smaller table entry than 4.x's. The app read their file names out of step before, so clashes and XML merges were missed. Both layouts are read now.
-- REDkit's `info.json` gives the mod's name and version. Its `gameVersion` is a REDkit number, not a game patch, so it's ignored.
 - Each format was checked against real files from mods and the game.
-
-**Clashes**
-- Texture (`texture.cache`) and sound (`soundspc.cache`) clashes get the ⚠ chip and priority numbers, so your order decides which one the game uses. Only each cache's table of contents is read, so even multi-GB caches are quick. An unknown layout is skipped, never wrongly flagged.
-- Text clashes: two mods giving the same text ID different words clash. The same words don't (a mod and its own patch). In the tooltip all of a mod's text clashes are one line, "Texts (.w3strings)" with a count.
-- Precompiled scripts (`precompiled.rsblob`) are read: the classes, enums and functions they define, and what they add (@addMethod, @addField), replace (@replaceMethod) or wrap (@wrapMethod). Two mods adding the same method or variable, or replacing the same function, get the red @ chip, "Won't work together". So does a mod whose copy of a game script changes a function a precompiled mod replaces. Wrapping the same function is fine, and so is a class two precompiled mods both carry (tested in game with Brothers in Arms and Quest Tweaks). A file that can't be read is noted, never guessed at.
-- Only clashes the app can actually see get priority numbers.
 
 **Merging mods made for older game versions**
 - A mod's copy of a script or XML made for an older version (1.32, say) used to look like it deleted everything CDPR added since, causing false conflicts and stripping newer code. Now it's compared with the file it was made from, and only the mod's own changes are merged onto your game's file. Where the game changed the same lines since, the mod's version of those lines is used.
@@ -173,11 +159,9 @@ Newest first. Versions match the ones on Nexus. From 1.0 on, fixes raise the las
 - The Install window says Update, Reinstall, Downgrade or Replace from the start for another version of a mod you have, keeps its name, section and Nexus ID, and doesn't ask again.
 - After an update, the old version's archive and older unused downloads of the same file go to the Trash. A newer archive is never touched.
 - Right-click → "Ignore update 1.2" hides the ↑ chip for that one version until a newer one comes out. Works on several mods at once.
-- The ↑ chip and a folded download card with a newer version are light blue, so green only ever means "fine". The update check says how many mods it's asking about, skipping ones checked in the last few hours, and goes on past a hidden or removed page (that mod gets ⊘).
+- The ↑ chip and a folded download card with a newer version are light blue, so green only ever means "fine". The update check says how many mods it's asking about, skipping ones checked in the last few hours. A hidden or removed page gets ⊘.
 
 **Nexus**
-- "Log in with Nexus" in Settings replaces pasting an API key, as Nexus requires for public apps. It switches on once the app's Nexus slug is filled in (`NEXUS_APP_SLUG`). Until then the app doesn't talk to Nexus at all; everything else works, including the GitHub downloads for merging. A key saved earlier is kept but unused.
-- For the developer's testing, his own key (recognised by its SHA-256 fingerprint, never stored in the script) still works as before.
 - Starting the app no longer contacts Nexus. The allowance in the footer shows after your first check or download.
 
 **Speed**
@@ -211,6 +195,38 @@ Newest first. Versions match the ones on Nexus. From 1.0 on, fixes raise the las
 - Settings files are only split at real line breaks, so a value holding U+2028 or a form feed stays one line. A readme value you changed only in dx12user.settings is remembered for that file.
 - Mods whose UTF-16 text files the app already converts no longer get the "older patch" chip.
 - The version tooltip is one line ("Made for 4.x, your game is 5.00c") without guessed dates. No long dashes anywhere in the app's text.
+
+## 0.4b · 2026-10-02
+
+Includes the fixes uploaded as 0.4c and 0.41b.
+
+**New**
+- Support for The Witcher 3 Remastered (5.00c), detected automatically.
+- Merged scripts and XML are written in UTF-8, with the matching XML header, as the Remastered requires.
+- On 5.x, which has no dx11filelist.txt / dx12filelist.txt, the app leaves them out.
+- Reads a mod's info file (REDkit's `info.json`) for its name and version, when it has one.
+- Texture, sound and text (.w3strings) clashes are detected and get priority numbers.
+- Precompiled scripts (.rsblob) are read, and mods that add or replace the same game function are flagged.
+- "Log in with Nexus" replaces entering a personal API key. It switches on once the app is registered with Nexus.
+
+**Improved**
+- The script view colours the new `map<>` and `set<>` types.
+- Various UI refinements and usability improvements.
+
+**Fixed**
+- The Nexus update check stopped with "Nexus rejected the API key" when a single mod page was hidden or removed.
+- Several minor bug fixes.
+
+### Details
+
+**Clashes**
+- Texture (`texture.cache`) and sound (`soundspc.cache`) clashes get the ⚠ chip and priority numbers, so your order decides which one the game uses. Only each cache's table of contents is read, so even multi-GB caches are quick. An unknown layout is skipped, never wrongly flagged.
+- Text clashes: two mods giving the same text ID different words clash. The same words don't (a mod and its own patch). In the tooltip all of a mod's text clashes are one line, "Texts (.w3strings)" with a count.
+- Precompiled scripts (`precompiled.rsblob`) are read: the classes, enums and functions they define, and what they add (@addMethod, @addField), replace (@replaceMethod) or wrap (@wrapMethod). Two mods adding the same method or variable, or replacing the same function, get the red @ chip, "Won't work together". So does a mod whose copy of a game script changes a function a precompiled mod replaces. Wrapping the same function is fine, and so is a class two precompiled mods both carry (tested in game with Brothers in Arms and Quest Tweaks). A file that can't be read is noted, never guessed at.
+- Only clashes the app can actually see get priority numbers.
+
+**Mod info files**
+- REDkit's `info.json` gives the mod's name and version. Its `gameVersion` is a REDkit number, not a game patch, so it's ignored.
 
 ## 0.3b · first release on Nexus
 
