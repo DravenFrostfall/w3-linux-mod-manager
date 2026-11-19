@@ -10,6 +10,7 @@
 - Merges script and XML conflicts between mods, and asks you only when two mods really clash.
 - Shows which mods clash on files, textures, sounds and keybinds, and lets you set who wins.
 - Adds the settings and keybinds a mod's readme asks for, and takes them back out with the mod.
+- Lets you change a mod's in-game menu settings from the app, or hide its menu in the game.
 - Groups the files of one mod together, with sections you name yourself.
 - Works with the old game (1.32), next-gen (4.x) and the Remastered (5.x), on GOG and Steam.
 
@@ -28,7 +29,7 @@ To update, put the new files next to the shortcut and start it. The new version 
 
 ## Nexus
 
-Update checks and "Mod Manager Download" links need a Nexus login. That switches on once the app is registered with Nexus. Until then the app doesn't contact Nexus at all, and everything else works.
+Update checks and changelogs work without a Nexus account or login. "Mod Manager Download" links need a Nexus login, which switches on once the app is registered with Nexus. Until then, download mods from Nexus by hand and install the archives in the app.
 
 ## More
 
