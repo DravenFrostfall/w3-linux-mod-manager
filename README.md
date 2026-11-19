@@ -27,10 +27,6 @@
 
 To update, put the new files next to the shortcut and start it. The new version moves in, and nothing is asked again.
 
-## Nexus
-
-Update checks and changelogs work without a Nexus account or login. "Mod Manager Download" links need a Nexus login, which switches on once the app is registered with Nexus. Until then, download mods from Nexus by hand and install the archives in the app.
-
 ## More
 
 - [CHANGELOG.md](CHANGELOG.md): what changed in each version.
