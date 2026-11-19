@@ -7,8 +7,8 @@ Newest first. Versions match the ones on Nexus. From 1.0 on, fixes raise the las
 ## 1.0 · 2026-11-19
 
 **New**
-- Update checks and changelogs work without a Nexus login, through Nexus's public GraphQL API (no key, no registration). With a login (or a developer's key file) the app uses Nexus's usual API as before.
-- The Downloads panel is there without a login too, with the archives you installed from your own files. Only Nexus downloads need the login.
+- "Check Nexus for updates" works without a Nexus account: no login, no key. Changelogs in the ↑ tooltip too.
+- The Downloads panel is always there, for the archives you install from your own files. Only downloading straight from Nexus waits for the login.
 - Settings links to the project's GitHub page, next to the version.
 - The mod list and the Downloads panel point at each other. Select a mod and the download it was installed from gets a steady bronze edge in the panel, scrolled into view only as far as needed: the exact file first (its own sub-card when its page's card is open), else its Nexus page's card. Several mods light up their page's card when they share one; mods from different pages, or one with no download, light nothing. It only works while the panel is open, and never opens it. The other way: click an installed download (the hand and a short tooltip say which ones) and its mod is selected in the list and scrolled to, its section opened if it's folded; click a page's card beside its files and every mod installed from it is selected. A download that isn't installed does nothing. The flash for a file you download again is now the brighter bronze, so it still shows on a card that's lit.
 - A mod whose folder in the game's Mods menu holds a single page now opens it straight away: Mods › Dynamic Scabbards shows its settings, not Mods › Dynamic Scabbards › Settings. A folder with several pages (Rational UI's Alchemy, Crafting and Inventory Icons) stays as it is. Worked out at every sync over every menu the game reads, other mods' and ones the app doesn't place included, so a folder becomes one again when a second page joins it. Never done for a page a mod's script finds by its name (Sharedutils' descriptions, a script watching menu pages open), which would stop working. The app places a copy of the menu file with the page's place changed and nothing else; the mod's own file isn't touched. Settings → Mod list → "Open a mod's only menu page directly" (on by default) turns it off.
@@ -36,7 +36,6 @@ Newest first. Versions match the ones on Nexus. From 1.0 on, fixes raise the las
 - A mod that's mostly overridden says so, in amber, first in its clash tooltip: "Mostly overridden · 38 of 40 files" when more than half of its files (textures or anything else) lose to higher priority mods, "Fully overridden" when all of them do. Keeping it does little or nothing: better to remove one of them. Half or less: nothing extra. Scripts are held to a stricter rule, since a lost script function can leave a mod half working: "Scripts partly unused" in the ƒ tooltip when precompiled mods take all its changes in one of its script files ("None of its changes from damageManagerProcessor.ws are used"), or more than a third of its script changes. The mod might not work properly or work only partly: best to remove one of them, since they're clearly not compatible. All of them: "Scripts fully unused".
 
 **Improved**
-- One version for everyone: no API key field. For testing until the app has its Nexus login, a personal API key in `_ModManager/nexus_key.txt` turns on the usual API and downloads (anyone's key, as Nexus asks of a testing build). The developer's key fingerprint is gone from the script.
 - A mod's settings window said "Its menu is out of the game now" for a mod whose menu isn't in the game. It now says why, in a few words: "This mod is off", "Its menu is left out" or "All mods are off"; the tooltip explains that the app keeps those settings and puts them back when the menu is in the game again.
 - Looks made consistent across windows: a mod's settings window puts Save and Cancel in the same order as Settings, Install and Edit; the Legacy Script Merger card in Settings folds with the same arrow as the Install window's cards; two error notes used a slightly different red from the rest of the app.
 - The same file packed byte for byte the same in two mods' bundles (same size and checksum in their tables) isn't listed as a clash anymore: whichever is used, the game gets the same file. Mods whose only shared files are such copies no longer get a priority number for them.
@@ -163,7 +162,7 @@ Newest first. Versions match the ones on Nexus. From 1.0 on, fixes raise the las
 - A file another installed mod might have made shows a short note, "Maybe another mod's"; its tooltip, "Maybe a different mod created it", lists every one of those mods below it, one per line. A file known only by when it was made says so in its tooltip. A window size saved while the old long notes stretched it is not brought back.
 
 **Checking for updates**
-- This is how the check works with a Nexus login (or a developer's key file). Without one it goes through Nexus's public GraphQL API: see Update checks without a login, below.
+- This is how the check works once you're logged in to Nexus. Without a login, see Update checks without a login, below.
 - Nexus keeps lists of the mods updated in the last day, week and month, each with when it was last updated. The check asks for the shortest one that reaches back to your oldest check, and asks about a page again when it's on that list with an update after its last check. A page not on it hasn't changed and counts as checked now.
 - A page never checked, or last checked more than 4 weeks ago (further than the month list reaches), is asked about anyway. One updated up to 15 minutes before its last check is asked again too, in case the list was a few minutes behind or your clock is off.
 - Without the list (an error on Nexus's side), pages checked in the last hour wait (it was 6 hours), so a Nexus having trouble isn't asked about every page at once. Right-click → "Check for update" still asks about that mod's page straight away.
@@ -302,7 +301,7 @@ Newest first. Versions match the ones on Nexus. From 1.0 on, fixes raise the las
 
 **Nexus login**
 - Follows Nexus's own OAuth 2.0 guide for public apps. Settings opens Nexus's login page in your browser; once you allow the app there, Nexus sends your browser back to `http://127.0.0.1:28651/callback`, a small listener the app runs on your PC for the duration of the login only. The app then trades the one-time code for an access token and a refresh token, and checks the token's signature against Nexus's public key before using it.
-- It switches on once the app's Nexus client ID is filled in (`NEXUS_CLIENT_ID`). Until then there's no login: update checks go through Nexus's public GraphQL API and Nexus downloads are off (see below).
+- It switches on once the app's Nexus client ID is filled in (`NEXUS_CLIENT_ID`). Until then there's no login: update checks still work, Nexus downloads are off (see below).
 - The access token is renewed by itself when it runs out, only when a request needs it (never at start). If Nexus refuses the renewal (you took the app's access back on Nexus), you're logged out and asked to log in again.
 - The tokens are kept in the settings file, which only your user can read, and are only ever sent to Nexus. Log out in Settings deletes them.
 - A personal API key pasted before the login existed is cleared once the login is set up, since Nexus doesn't allow personal keys in public apps. The app never asks anyone for a personal key: the old "get a key on Nexus" prompt and link are gone.
@@ -313,20 +312,10 @@ Newest first. Versions match the ones on Nexus. From 1.0 on, fixes raise the las
 - A download from a "Mod Manager Download" link passes on the link's own key and expiry, as Nexus requires for accounts without Premium. The API key is only ever sent to Nexus's API, never to the file server.
 
 **Update checks without a login**
-- Nexus support and its GraphQL documentation say public mod data can be read without a key or registration; only downloads need a registered app. So without a login (or a developer's key file), "Check Nexus for updates" asks Nexus's GraphQL API. No key is ever sent this way.
-- One request gives the version, status and last upload of every page you have (50 pages a request), then a request for the files of the pages with something new (10 pages a request).
-- A page's last upload is its newest file's upload time (checked against the usual API on real pages), so a page with no new upload, version or status since its files were last fetched isn't asked for them again, unless that was over a week ago. With 200 mods, a check with nothing new takes 4 requests.
-- The files' groups give exactly the usual API's record of which file replaced which, so renamed files are still found as updates, and each file carries the page's changelog for its version, the same lines. Both checked on real pages.
-- The answers are kept the same way as before, so the ↑ chips, "Ignore update" and the changelog in the ↑ tooltip work as with a login; on five real mods the results were identical to the usual API's.
-- GraphQL also lists files an author took off the page (as archived) and has no download names (one known from an earlier check is kept).
-- One page Nexus can't find empties its whole answer, so it's taken out and the rest asked again; it's marked hidden. A page Nexus can't answer about is left as it was and counted as left.
-- A check makes at most 100 requests (about 900 mods). Past that it stops, the status line says how many are left, and the next check starts with those.
-
-**Developer key file**
-- Nexus registers an app after trying a testing build that works with a personal API key, and allows personal keys for testing and personal use, never as a public app's login. So the app never asks anyone for one: there's no API key field.
-- While `NEXUS_CLIENT_ID` is empty, a personal API key (from the API Keys page of a Nexus account) on the first line of `nexus_key.txt`, next to the settings file in `_ModManager`, turns on the usual API: update checks through it, Mod Manager Download links and Retry. Settings then says "Developer key" after the version at the bottom (the file's place in its tooltip), with nothing to edit.
-- The file is made readable by you alone and read again when it changes. Its key is never written into the settings file, and a key saved there by an earlier version stays as it was, unused.
-- Once the client ID is filled in, the file is ignored and everyone logs in with Nexus. The developer's key fingerprint is gone from the script.
+- Nexus lets anyone read a mod page's versions, files and changelogs; only downloads need an app Nexus has registered. So the check works without an account, and no key is ever sent.
+- It asks about all your mods at once (50 pages a request) and fetches files only for pages with something new. With 200 mods, a check with nothing new takes 4 requests.
+- Results were compared with what a logged-in check gets on real mods: the same updates, the same changelogs, the same files found as renamed updates.
+- At most 100 requests per check (about 900 mods). Past that it stops, says how many are left, and the next check starts with those.
 
 **Downloads panel without a login**
 - The panel and its footer button are always there. Without a login it says "Mods you install from your own files show here.", its tooltip says what turns Nexus downloads on, "Mod Manager Download" links aren't taken, and a failed Nexus download's Retry is off with the same tooltip.
