@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# W3 Linux Mod Manager. Free software under the GNU General Public License v3 or later,
+# with NO WARRANTY. Full text: https://www.gnu.org/licenses/gpl-3.0.html
+# Parts ported from W3 Mod Workbench are MIT licensed; their notice is kept where they start.
 """
 W3 Linux Mod Manager: a small Witcher 3 mod manager for Linux (Proton / Wine).
 
@@ -71,14 +75,15 @@ from PyQt6.QtWidgets import (
 )
 
 APP_NAME = "W3 Linux Mod Manager"
+APP_URL = "https://github.com/DravenFrostfall/w3-linux-mod-manager"   # the project page, in Settings
 NEXUS_APP_NAME = "w3-linux-mod-manager"    # how the app names itself to Nexus (Application-Name, User-Agent)
 # the version on Nexus: raise it with every upload, and give it a heading in CHANGELOG.md
-# ("b" = beta: kept until the app is stable; new features raise the number: 0.5b -> 0.6b)
-APP_VERSION = "0.6b"
+# 1.0: stable and feature complete. Fixes raise the last number (1.0.1), new features the middle one (1.1)
+APP_VERSION = "1.0"
 # Nexus login (OAuth 2.0 with PKCE). Paste the app's client ID from Nexus support between the quotes.
 # With it, Settings has a "Log in with Nexus" button, and update checks and Nexus downloads work.
-# Left empty, the app talks to Nexus only in a testing build (NEXUS_TESTING below), with a
-# personal API key.
+# Left empty, update checks still work (Nexus's public GraphQL API, no key), and downloads are off,
+# unless a developer's key file is there (NEXUS_KEY_FILE below).
 NEXUS_CLIENT_ID = ""
 # The port on this PC the login's answer comes back to: http://127.0.0.1:<port>/callback is the
 # callback URI registered with Nexus, so it must stay the same (see NEXUS_OAUTH_REDIRECT).
@@ -98,25 +103,54 @@ def _user_agent():
 
 
 USER_AGENT = _user_agent()
-# A testing build: while NEXUS_CLIENT_ID is empty, Settings takes a personal API key (from the
-# API Keys page of a Nexus account), and update checks and Nexus downloads work with it. Nexus
-# allows personal keys only for testing and personal use, not in a public app, so a public
-# release before the client ID arrives needs this set to False: then the app doesn't talk to
-# Nexus at all, and a key saved earlier stays in the settings file, unused. Once NEXUS_CLIENT_ID
-# is filled in this does nothing: a saved key is cleared at start, and only the login is used.
-NEXUS_TESTING = True
+# For testing while the app has no Nexus login (NEXUS_CLIENT_ID empty): a personal API key (from
+# the API Keys page of a Nexus account) in this file, next to the settings file in _ModManager,
+# and the app uses it for everything on Nexus, downloads included. Nexus allows personal keys for
+# testing and personal use, not as a public app's login, so the app never asks anyone for one:
+# without the file there's no key field, update checks go through Nexus's public GraphQL API and
+# downloads wait for the login. Once NEXUS_CLIENT_ID is filled in, the file is ignored and
+# everyone, the developer too, logs in with Nexus.
+NEXUS_KEY_FILE = "nexus_key.txt"
+_KEY_SEEN = {}
 
 
-def _test_key(key):
-    return NEXUS_TESTING and bool(str(key or "").strip())
+def key_file():
+    """Where a developer's key file goes: next to the settings file."""
+    return Path(CONFIG_FILE).parent / NEXUS_KEY_FILE
+
+
+def file_key():
+    """The personal API key in the key file (its first line), or "" (no file, or the app has its
+    Nexus login). Read again only when the file changes; made readable by you alone if it isn't."""
+    if NEXUS_CLIENT_ID:
+        return ""
+    path = key_file()
+    try:
+        st = path.stat()
+    except OSError:
+        return ""
+    sig = (str(path), st.st_mtime_ns, st.st_size)
+    if _KEY_SEEN.get("sig") != sig:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        if st.st_mode & 0o077:
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+        _KEY_SEEN.update(sig=sig, key=next((l.strip() for l in text.splitlines() if l.strip()), ""))
+    return _KEY_SEEN["key"]
 
 
 def nexus_on(cfg=None):
-    """Does the app talk to Nexus? With the login set up, yes; before that, only in a testing
-    build with a personal API key (see NEXUS_TESTING)."""
+    """Does the app use Nexus's keyed API (downloads, the usual update check)? With the login set
+    up, yes; before that, only with a developer's key file (see NEXUS_KEY_FILE). Without it, update
+    checks go through the public GraphQL API."""
     if NEXUS_CLIENT_ID:
         return True
-    return _test_key((cfg or {}).get("nexus_key") or _HELD.get("nexus_key"))
+    return bool(file_key())
 MANAGER_DIRNAME = "_ModManager"
 VENV_NAME = "w3modmanager_venv"       # the launcher's private Python setup, when the system has no PyQt6
 COMPILED_NAME = "w3modmanager.compiled"  # the launcher's ready-to-run copy of the app (see the launcher)
@@ -211,10 +245,12 @@ def load_config():
     if not cfg.get("game_dir") and HOME_GAME is not None and is_game_dir(HOME_GAME):
         cfg["game_dir"] = str(HOME_GAME)          # the app sits in the game's _ModManager: that game
     cfg.pop("nexus_oauth", None)                  # the login's tokens: only ever through oauth_tokens()
-    if not NEXUS_CLIENT_ID and not _test_key(cfg.get("nexus_key")):
-        # no Nexus login yet: nothing goes to Nexus, so no key is handed out. One saved earlier
-        # stays in the file for when the login is there.
+    if not NEXUS_CLIENT_ID:
+        # no Nexus login yet: a key saved in the settings earlier isn't used (it stays in the file,
+        # untouched); a developer's key file is (see NEXUS_KEY_FILE)
         _HELD.update({k: cfg.pop(k) for k in ("nexus_key",) if k in cfg})
+        if file_key():
+            cfg["nexus_key"] = file_key()
     else:
         _HELD.clear()
     return cfg
@@ -230,9 +266,10 @@ def save_config(cfg):
             and APP_DIR.name.lower() != MANAGER_DIRNAME.lower():
         cfg = _adopt_home(home, cfg)
     if not NEXUS_CLIENT_ID:
-        if _test_key(cfg.get("nexus_key")):
-            _HELD.clear()                          # a personal key just pasted in a testing build
-        cfg = {**{k: v for k, v in cfg.items() if k not in _HELD}, **_HELD}
+        # the key file's key never goes into the settings file; one saved there earlier stays as it was
+        fk = file_key()
+        cfg = {**{k: v for k, v in cfg.items() if k not in _HELD and not (k == "nexus_key" and fk and v == fk)},
+               **_HELD}
     cfg = {k: v for k, v in cfg.items() if k != "nexus_oauth"}
     tokens = oauth_tokens()                       # this process's own copy, never an older one
     if tokens:
@@ -1292,9 +1329,14 @@ def nexus_login_needed():
     """(title, what to do) when there's no key, in the words of the login Settings offers."""
     if NEXUS_CLIENT_ID:
         return "Nexus login needed", "Log in to Nexus in Settings."
-    if NEXUS_TESTING:
-        return "Nexus API key needed", "Paste your personal API key in Settings."
-    return "Nexus is off", "This version doesn't connect to Nexus yet."
+    return "Nexus downloads are off", "This version can't download from Nexus yet. Update checks still work."
+
+
+def nexus_downloads_tip():
+    """What turns Nexus downloads on, for a downloads panel without them."""
+    if NEXUS_CLIENT_ID:
+        return "Nexus downloads switch on once you log in to Nexus in Settings."
+    return "Nexus downloads switch on in a version that can log in to Nexus."
 
 
 class NexusUnreachable(RuntimeError):
@@ -1359,6 +1401,145 @@ def nexus_get(path, api_key, _again=True, _retry=True):
                                else "The connection to Nexus dropped.") from e
     except ValueError as e:
         raise RuntimeError("Nexus sent an answer the app couldn't read.") from e
+
+
+# --- Nexus without a login: the public GraphQL API (v2) ------------------------------------------
+# Without a Nexus login (or a personal key in a testing build) the update check and changelogs come
+# from Nexus's GraphQL API, which needs no key and no registration for public mod data ("Most of
+# GraphQL V2 is accessible without authentication"; Nexus support: GraphQL "can be used without
+# registering" when an app doesn't download files). Downloads still need the login. Once there is
+# one, everything goes back to the API above, unchanged.
+NEXUS_GQL = "https://api.nexusmods.com/v2/graphql"
+GQL_MODS_PER_CALL = 50          # mods asked about in one request (one alias each)
+GQL_FILES_PER_CALL = 10         # mods whose files are asked for in one request
+GQL_BUDGET = 100                # requests per check at most: Nexus publishes no allowance for it
+GQL_FILES_FRESH = 7 * 86400     # a page's files are asked for again after this long even if it shows no
+                                # new upload (an author can move or remove a file without uploading one)
+# words in GraphQL's error for one mod that mean its page can't be shown (hidden, removed...);
+# any other error leaves what the app knew about that page as it was
+GQL_GONE_WORDS = ("not_found", "not found", "hidden", "removed", "moderat", "permission", "forbidden",
+                  "not available", "unavailable", "does not exist", "not published", "deleted")
+
+
+def nexus_gql(query, _retry=True):
+    """One request to Nexus's public GraphQL API -> its answer ({"data": ..., "errors": [...]}).
+    No key is sent. Errors as nexus_get raises them. An answer whose errors name the parts they're
+    about comes back as it is, even with no data (one mod Nexus can't find empties the whole
+    answer: the caller asks again without it); errors and no data with nothing named (a question
+    Nexus didn't understand) are a RuntimeError with Nexus's own message."""
+    req = urllib.request.Request(
+        NEXUS_GQL, data=json.dumps({"query": query}).encode("utf-8"), method="POST",
+        headers={"Content-Type": "application/json", "Accept": "application/json",
+                 "Application-Name": NEXUS_APP_NAME, "Application-Version": APP_VERSION,
+                 "User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            out = json.loads(r.read().decode("utf-8", errors="ignore"))
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            raise RuntimeError("Nexus rate limit reached. Try again later.") from e
+        raise RuntimeError(f"Nexus returned HTTP {e.code}.") from e
+    except urllib.error.URLError as e:
+        reason = e.reason
+        if isinstance(reason, (TimeoutError, socket.timeout)):
+            if _retry:
+                time.sleep(2)
+                return nexus_gql(query, _retry=False)
+            raise NexusUnreachable("Nexus didn't answer in time.") from e
+        raise NexusUnreachable(f"Couldn't reach Nexus: {reason}") from e
+    except (TimeoutError, ConnectionError, ssl.SSLError, http.client.HTTPException) as e:
+        if _retry:
+            time.sleep(2)
+            return nexus_gql(query, _retry=False)
+        raise NexusUnreachable("Nexus didn't answer in time." if isinstance(e, TimeoutError)
+                               else "The connection to Nexus dropped.") from e
+    except ValueError as e:
+        raise RuntimeError("Nexus sent an answer the app couldn't read.") from e
+    if not isinstance(out, dict):
+        raise RuntimeError("Nexus sent an answer the app couldn't read.")
+    if not isinstance(out.get("data"), dict) and not gql_errors(out):
+        errors = out.get("errors") or []
+        msg = next((str(e.get("message")) for e in errors if isinstance(e, dict) and e.get("message")), "")
+        raise RuntimeError(f"Nexus couldn't answer: {msg}" if msg else "Nexus sent an answer the app couldn't read.")
+    return out
+
+
+def gql_errors(answer):
+    """{alias: its errors (message and code, lower-cased)} from a GraphQL answer."""
+    out = {}
+    for e in (answer or {}).get("errors") or []:
+        if isinstance(e, dict) and e.get("path"):
+            code = str(((e.get("extensions") or {}).get("code")) or "").lower()
+            out.setdefault(str(e["path"][0]), []).append(f"{code} {str(e.get('message') or '').lower()}")
+    return out
+
+
+def gql_ask(query_for, aliases, rounds=3):
+    """Ask about these aliases (query_for(aliases) builds the question): (data, errors per alias).
+    Nexus empties its whole answer when one part can't be found, so the parts its errors name are
+    taken out and the rest asked again (a few times at most). Raises as nexus_gql does."""
+    data, errors, ask = {}, {}, list(aliases)
+    for _ in range(rounds):
+        if not ask:
+            break
+        got = nexus_gql(query_for(ask))
+        errs = gql_errors(got)
+        errors.update(errs)
+        if isinstance(got.get("data"), dict):
+            data.update({a: got["data"].get(a) for a in ask})
+            break
+        ask = [a for a in ask if a not in errs]
+    return data, errors
+
+
+def gql_gone(messages):
+    """Do these errors say the page can't be shown (rather than something going wrong)?"""
+    return any(w in m for m in messages for w in GQL_GONE_WORDS)
+
+
+def iso_time(text):
+    """A GraphQL date ("2007-12-03T10:15:30Z") or Unix time -> Unix time; 0 when neither."""
+    if isinstance(text, (int, float)):
+        return int(text)
+    t = str(text or "").strip()
+    if t.isdigit():
+        return int(t)
+    try:
+        return int(datetime.datetime.fromisoformat(t.replace("Z", "+00:00")).timestamp())
+    except ValueError:
+        return 0
+
+
+def gql_files(rows, known=None):
+    """A page's files from GraphQL's modFiles, as the app keeps them (see nexus_files), with
+    which file replaced which and {version: changelog lines}. Checked against Nexus's usual API
+    on real pages (19 Nov): files in one group are the versions of one file, so each replaced the
+    one before it in the group (exactly the API's record); each file's changelog is the page's
+    changelog for its version. GraphQL also lists files an author took off the page (as archived).
+    It has no download names: one known from an earlier check (known: {file id: name}) is kept."""
+    files, log, groups = [], {}, {}
+    for f in rows or []:
+        if not isinstance(f, dict) or f.get("fileId") is None:
+            continue
+        exact = _int(f.get("sizeInBytes"), 0)
+        version = clean_version(f.get("version") or "")
+        files.append({"id": f["fileId"], "name": f.get("name") or "", "file_name": (known or {}).get(f["fileId"], ""),
+                      "version": version, "cat": str(f.get("category") or "").upper(),
+                      "at": iso_time(f.get("date")), "size": exact or _int(f.get("size"), 0) * 1024,
+                      "exact": bool(exact)})
+        if f.get("groupId") is not None:
+            groups.setdefault(f["groupId"], []).append(files[-1])
+        lines = f.get("changelogText") or []
+        if isinstance(lines, str):
+            lines = lines.splitlines()
+        if version and isinstance(lines, list):
+            have = log.setdefault(f.get("version") or version, [])
+            have += [l for l in lines if isinstance(l, str) and l not in have]   # files of one version share it
+    updates = []
+    for group in groups.values():
+        group.sort(key=lambda x: (x["at"], _int(x["id"], 0)))
+        updates += [[a["id"], b["id"]] for a, b in zip(group, group[1:])]
+    return {"files": files, "updates": updates}, nexus_changelog(log)
 
 
 # --- Nexus login (OAuth 2.0 with PKCE) -------------------------------------------------------------
@@ -4621,7 +4802,7 @@ def menu_image_rows(text):
     """A description that's only rows of pictures under short headings ("Vanilla:", three icons;
     "Tiered:", three icons, as Rational Inventory Icons shows its choices) laid out with each
     heading beside its pictures, not over them: half the height, the card no taller than it needs
-    (Remos, 30 Oct: "too much wasted space"). Any other description as it is."""
+    (30 Oct: "too much wasted space"). Any other description as it is."""
     lines = [l for l in re.split(r"<br\s*/?>", text, flags=re.I)]
     pairs, i = [], 0
     while i < len(lines):
@@ -13060,7 +13241,11 @@ class ModManager:
 
     def check_updates(self, api_key, progress=None, only=None, force=False):
         """Ask Nexus about every mod that has an ID, apart from ones answered in the last
-        hour, or by Nexus's list of updated mods when it can be had (see pages_changed)."""
+        hour, or by Nexus's list of updated mods when it can be had (see pages_changed).
+        Without a key or login (api_key empty): through the public GraphQL API instead
+        (check_updates_public)."""
+        if not api_key:
+            return self.check_updates_public(progress, only, force)
         cache = self.state.setdefault("nexus_cache", {})
         mods, all_ids, wanted = self.update_check_plan(only, force)
         skipped = len(mods) - len(all_ids)
@@ -13158,6 +13343,154 @@ class ModManager:
                 "pages_asked": done, "pages_same": list(same),
                 "pages_left": [n for n in wanted if n not in set(done)] if left else []}
 
+    def _gql_game_id(self):
+        """Nexus's number for The Witcher 3, which GraphQL asks for: asked once and kept."""
+        gid = str(self.state.get("nexus_game_id") or "")
+        if not gid:
+            got = nexus_gql('query { game(domainName: "%s") { id } }' % NEXUS_DOMAIN)
+            gid = str(((got["data"].get("game") or {}).get("id")) or "")
+            if not gid.isdigit():
+                raise RuntimeError("Nexus didn't say which game is The Witcher 3.")
+            self.state["nexus_game_id"] = gid
+        return gid
+
+    def check_updates_public(self, progress=None, only=None, force=False):
+        """The update check without a Nexus login, through the public GraphQL API: one request
+        for every page's version, status and last upload (50 pages each), then the files of the
+        pages with something new (10 pages a request), with which file replaced which and the
+        page's changelog. A page's last upload is its newest file's upload time (checked against
+        the usual API on real pages, 19 Nov), so a page whose last upload, version and status
+        haven't changed since its files were last fetched isn't asked for them again, unless
+        that was over a week ago or the check is forced. Gives the same answer as check_updates,
+        kept the same way, so everything after (the ↑ chips, Ignore update, renamed files, the
+        changelog in the tooltip) works as with a login. A page Nexus can't find is marked
+        hidden; one it can't answer about is left as it was."""
+        cache = self.state.setdefault("nexus_cache", {})
+        mods, all_ids, _wanted = self.update_check_plan(only, True)
+        skipped = len(mods) - len(all_ids)
+        pages = [n for n in all_ids if n.isdigit()]
+        calls, same, done, gone, left, offline = 0, [], [], [], [], ""
+        capped = []                                      # set once the request budget runs out
+        now = int(time.time())
+        result = lambda: {"checked": len(done) + len(same), "asked": len(done), "unchanged": len(same),
+                          "skipped": skipped, "fresh": 0, "capped": any(capped) and not offline,
+                          "left": len(left), "offline": offline, "pages_asked": list(done),
+                          "pages_same": list(same), "pages_left": list(left), "public": True}
+        try:
+            gid = self._gql_game_id()
+        except NexusUnreachable as e:
+            offline, left = str(e), list(pages)
+            return result()
+        info, need = {}, []
+        for i in range(0, len(pages), GQL_MODS_PER_CALL):
+            chunk = pages[i:i + GQL_MODS_PER_CALL]
+            if calls >= GQL_BUDGET:
+                left += [n for n in pages[i:]]
+                capped.append(True)
+                break
+            ask = lambda names: "query { " + " ".join(
+                f'{a}: mod(modId: "{a[1:]}", gameId: "{gid}") {{ modId name version status updatedAt }}' for a in names) + " }"
+            try:
+                data, errors = gql_ask(ask, [f"m{n}" for n in chunk])
+            except NexusUnreachable as e:
+                offline = str(e)
+                left += [n for n in pages[i:]]
+                break
+            calls += 1
+            for n in chunk:
+                row = data.get(f"m{n}")
+                if not isinstance(row, dict):
+                    if gql_gone(errors.get(f"m{n}", [])):
+                        cache[n] = {**cache.get(n, {}), "available": False, "status": "hidden", "checked": now}
+                        gone.append(n)
+                    else:
+                        left.append(n)                   # Nexus couldn't say: nothing about it changes
+                    continue
+                info[n] = row
+                page = cache.get(n) or {}
+                status = str(row.get("status") or "")
+                fetched = page.get("files_at") or 0
+                if (force or not page.get("files") or status.lower() not in ("", "published")
+                        or not page.get("available", True) or status != page.get("status")
+                        or clean_version(row.get("version") or "") != page.get("version")
+                        or iso_time(row.get("updatedAt")) >= fetched - UPDATED_SLACK
+                        or now - fetched > GQL_FILES_FRESH):
+                    need.append(n)
+                else:                                    # nothing new on the page: its files as they were
+                    page.update(name=row.get("name") or page.get("name", ""), checked=now)
+                    same.append(n)
+        need.sort(key=lambda n: cache.get(n, {}).get("checked", 0))         # stalest first
+        total = len(need)
+        for i in range(0, len(need), GQL_FILES_PER_CALL):
+            chunk = need[i:i + GQL_FILES_PER_CALL]
+            if offline or calls >= GQL_BUDGET:
+                left += [n for n in need[i:]]
+                capped.append(not offline)
+                break
+            live = [n for n in chunk if str(info[n].get("status") or "").lower() in ("", "published")]
+            data, errors = {}, {}
+            if live:
+                ask = lambda names: "query { " + " ".join(
+                    f'{a}: modFiles(modId: "{a[1:]}", gameId: "{gid}") '
+                    '{ fileId name version category date size sizeInBytes groupId changelogText }' for a in names) + " }"
+                try:
+                    data, errors = gql_ask(ask, [f"f{n}" for n in live])
+                except NexusUnreachable as e:
+                    offline = str(e)
+                    left += [n for n in need[i:]]
+                    break
+                calls += 1
+            for n in chunk:
+                row, before = info[n], cache.get(n) or {}
+                status = str(row.get("status") or "")
+                rows = data.get(f"f{n}")
+                if n in live and not isinstance(rows, list) and not gql_gone(errors.get(f"f{n}", [])):
+                    left.append(n)                       # its files couldn't be had: as it was
+                    continue
+                known = {f["id"]: f["file_name"] for f in before.get("files") or [] if f.get("file_name")}
+                files, log = gql_files(rows, known) if isinstance(rows, list) else (None, {})
+                cache[n] = {"version": clean_version(row.get("version") or ""), "name": row.get("name") or "",
+                            "available": status.lower() in ("", "published"), "status": status,
+                            "files": files["files"] if files else None,
+                            "updates": merged_updates(before.get("updates"), files["updates"] if files else []),
+                            "file_log": log, "checked": now, "files_at": now if files else 0}
+                for key in ("changelog", "changelog_for", "changelog_from"):
+                    if key in before:
+                        cache[n][key] = before[key]
+                for m in self.mods:
+                    if str(m.get("nexus") or "") == n and not m.get("nexus_cat"):
+                        got_file = self.nexus_file_of(m, cache[n])
+                        if got_file and got_file[1]["cat"] in NEXUS_LIVE:
+                            m["nexus_cat"] = got_file[1]["cat"]
+                done.append(n)
+                if progress:
+                    progress(len(done), total)
+        done += gone
+        if not left and not offline and only is None:
+            self.state["nexus_checked"] = now
+        self.pin_nexus_files()
+        self._changelogs_from_files(all_ids)
+        self.save()
+        return result()
+
+    def _changelogs_from_files(self, pages):
+        """Without a login, the changelog shown for an update waiting: the page's changelog as
+        GraphQL gives it, with each file (the same lines as the usual API's, checked 19 Nov).
+        Lines an earlier check with a login brought stay; one with a login asks again."""
+        cache = self.state.setdefault("nexus_cache", {})
+        for nid in pages:
+            page = cache.get(nid)
+            if not page or not page.get("files") or "file_log" not in page:
+                continue
+            waiting = sorted({v for m in self.mods if str(m.get("nexus") or "") == nid
+                              for v in [self.update_waiting(m)] if v})
+            if not waiting or (page.get("changelog_for") == waiting and page.get("changelog_from") == "files"):
+                continue
+            log = dict(page.get("changelog") or {})
+            for ver, lines in (page.get("file_log") or {}).items():
+                log.setdefault(ver, lines)
+            page["changelog"], page["changelog_for"], page["changelog_from"] = log, waiting, "files"
+
     def _fetch_changelogs(self, pages, api_key, calls=0):
         """The changelog of every page here with an update waiting that it wasn't fetched for yet:
         asked once all pages are checked and each mod's own upload is known, so an update found
@@ -13171,7 +13504,7 @@ class ModManager:
                 continue
             waiting = sorted({v for m in self.mods if str(m.get("nexus") or "") == nid
                               for v in [self.update_waiting(m)] if v})
-            if not waiting or page.get("changelog_for") == waiting:
+            if not waiting or (page.get("changelog_for") == waiting and page.get("changelog_from") != "files"):
                 continue
             known = any(k.endswith("-remaining") for k in LAST_LIMITS)
             if not (allowance() >= 1 if known else calls + 1 <= BLIND_BUDGET):
@@ -13180,6 +13513,7 @@ class ModManager:
             try:
                 page["changelog"] = nexus_changelog(nexus_get(f"{NEXUS_GAME}/mods/{nid}/changelogs.json", api_key))
                 page["changelog_for"] = waiting
+                page.pop("changelog_from", None)
             except NexusUnreachable:
                 break
             except NexusForbidden:
@@ -14833,7 +15167,7 @@ class ModManager:
             self.state.pop("menu_restore", None)
         # a value with ':' or ';' in it is never added: the game cuts a value at ':', and with such a
         # value followed by more lines it threw the whole file away and reset every setting
-        # (Remos's tests, 18 Oct: Upgrade Kits Hardcore's "UKHC_ReportStatus=NOT_STARTED: …; …"
+        # (tests, 18 Oct: Upgrade Kits Hardcore's "UKHC_ReportStatus=NOT_STARTED: …; …"
         # first, then 101 more lines: reset; the same line alone, or the 101 alone: fine)
         blocked = self.state["user_blocked"] = {}           # mod id -> ["[Section] key"] left out
         for key, (section, line, mid) in list(desired.items()):
@@ -18242,9 +18576,10 @@ class SetupDialog(RememberingDialog):
         self.login_btn.clicked.connect(self._login_clicked)
         self.key = QLineEdit(cfg.get("nexus_key", ""))
         self.key.setEchoMode(QLineEdit.EchoMode.Password)
-        self.key.setPlaceholderText("your personal API key, for testing")
-        self.key.setToolTip("From the API Keys page of your Nexus account. Only for testing, until\n"
-                            "this app has its Nexus login.")
+        # a developer's key file (see NEXUS_KEY_FILE): said after the version at the bottom, its tooltip this
+        self.key_note = QLabel("Developer key", objectName="Muted")
+        self.key_note.setToolTip(f"Nexus: the personal API key in {key_file()}\nFor testing until this app has its "
+                                 "Nexus login. Delete the file to stop using it.")
         show = QPushButton("Show")
         show.setCheckable(True)
         show.toggled.connect(lambda on: (self.key.setEchoMode(
@@ -18252,16 +18587,15 @@ class SetupDialog(RememberingDialog):
         if NEXUS_CLIENT_ID:
             heading("Nexus")
             line("Account", self.login_state, self.login_btn)
-            for w in (self.key, show):
+            for w in (self.key, show, self.key_note):
                 w.hide()
             self._show_login()
-        elif NEXUS_TESTING:
-            heading("Nexus")
-            line("API key", self.key, show)               # a testing build: a personal key
-            for w in (self.login_state, self.login_btn):
+        elif file_key():
+            # a developer's key file: said after the version at the bottom, no section of its own
+            for w in (self.key, show, self.key_note, self.login_state, self.login_btn):
                 w.hide()
         else:
-            for w in (self.key, show, self.login_state, self.login_btn):
+            for w in (self.key, show, self.key_note, self.login_state, self.login_btn):
                 w.hide()
 
         # the font the Script Decisions window shows code in, with a line to judge it by
@@ -18386,7 +18720,17 @@ class SetupDialog(RememberingDialog):
         logo = QLabel()
         logo.setPixmap(app_icon().pixmap(QSize(56, 56), self.devicePixelRatioF()))
         logo.setFixedSize(56, 56)
-        about = QLabel(f"<b>{html.escape(APP_NAME)}</b><br><span style='color:{C['ash']}'>Version {html.escape(APP_VERSION)}</span>")
+        dev = bool(file_key())                          # a developer's key file: said after the version
+        link = (f"<a href='{html.escape(APP_URL)}' style='color:{C['bronze_muted']}; text-decoration:none'>"
+                f"GitHub</a>")                          # the project page: a link, quiet like the rest
+        about = self.about = QLabel(f"<b>{html.escape(APP_NAME)}</b><br><span style='color:{C['ash']}'>Version "
+                                    f"{html.escape(APP_VERSION)}  ·  {link}{'  ·  Developer key' if dev else ''}"
+                                    f"</span>")
+        about.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse)
+        about.linkActivated.connect(lambda url: QDesktopServices.openUrl(QUrl(url)))
+        tip = self.key_note.toolTip() if dev else ""
+        about.setToolTip(tip)
+        about.linkHovered.connect(lambda url: about.setToolTip(url or tip))   # on the link: where it goes
         foot.addWidget(logo, 0, Qt.AlignmentFlag.AlignVCenter)
         foot.addWidget(about, 0, Qt.AlignmentFlag.AlignVCenter)
         foot.addStretch(1)
@@ -22189,10 +22533,10 @@ class QuietWheelCombo(QComboBox):
         # its list drops under the field (combobox-popup: 0 in the window style), not over it with the
         # chosen entry on the field: that kind scrolls by arrows at its ends, and on Wayland, where the
         # list's new size (with the shadow's margin) arrives a moment late, an arrow stayed on and cut
-        # off the last entry (Remos, 30 Oct)
+        # off the last entry (30 Oct)
         box = self.view().parentWidget()
         # Qt turned the list's scrollbar off when the view was set, before the window style said
-        # the list drops under the field: a long list then had no scrollbar (Remos, 30 Oct)
+        # the list drops under the field: a long list then had no scrollbar (30 Oct)
         self.view().setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         lay = box.layout()
         if lay:
@@ -22206,7 +22550,7 @@ class QuietWheelCombo(QComboBox):
         if lay:
             lay.activate()
         rows = [i for i in range(self.count()) if not v.isRowHidden(i)][:self.maxVisibleItems()]
-        # wide enough for its longest choice, never cut short (Remos, 30 Oct): it grows to the left,
+        # wide enough for its longest choice, never cut short (30 Oct): it grows to the left,
         # its right edge staying at the field's
         frame = v.width() - v.viewport().width()
         bar = v.verticalScrollBar().sizeHint().width() if self.count() > len(rows) else 0
@@ -22246,7 +22590,7 @@ class QuietWheelCombo(QComboBox):
 class MenuRule(QFrame):
     """The divider between two settings in a card: one screen pixel thick wherever it falls. A
     styled 1-pixel line came out one or two pixels thick on a scaled display (125 %, 150 %),
-    depending on where it landed (Remos, 30 Oct). inset: it starts where a sub-setting's name does."""
+    depending on where it landed (30 Oct). inset: it starts where a sub-setting's name does."""
 
     def __init__(self, inset=False):
         super().__init__(objectName="MenuRule")
@@ -22256,7 +22600,7 @@ class MenuRule(QFrame):
     def paintEvent(self, _e):
         p = QPainter(self)
         line = QColor(C["ridge"])
-        line.setAlphaF(0.85)                        # 15 % see-through: a touch quieter (Remos, 30 Oct)
+        line.setAlphaF(0.85)                        # 15 % see-through: a touch quieter (30 Oct)
         pen = QPen(line)
         pen.setCosmetic(True)                       # one device pixel, whatever the scale
         pen.setWidth(0)
@@ -22274,7 +22618,7 @@ class MenuRule(QFrame):
 class MenuRow(QFrame):
     """A setting's row in a mod's settings window, with the gold dot in front of it while you've
     changed it, painted by the row itself: no small widget of its own sits there, since one left a
-    dark square on the hovered row on Remos's desktop (30 Oct), styled or painted."""
+    dark square on the hovered row on a test desktop (30 Oct), styled or painted."""
     DOT_X, DOT = 14, 6                              # the row's left margin; the dot's size
 
     BRANCH_X = 38                                   # under the start of a setting's name: its sub-settings' line
@@ -22293,8 +22637,8 @@ class MenuRow(QFrame):
     def paintEvent(self, e):
         super().paintEvent(e)                       # its background, lighter while hovered
         if self.indent or self.next_indent:
-            # a sub-setting (tagged indent): a tree line from under its main setting's name (Remos,
-            # 30 Oct: style 1), in a quiet grey a step lighter than the dividers (bronze was too loud)
+            # a sub-setting (tagged indent): a tree line from under its main setting's name
+            # (30 Oct: style 1), in a quiet grey a step lighter than the dividers (bronze was too loud)
             p = QPainter(self)                      # not smoothed: no faint seam where rows and dividers meet
             pen = QPen(QColor(C["ridge_hi"]), 1.5)
             pen.setCapStyle(Qt.PenCapStyle.FlatCap)
@@ -22621,7 +22965,7 @@ class MenuSettingsDialog(RememberingDialog):
             raw_pictures = bool(re.search(r"<\s*img\b", tip or "", re.I))   # as the mod wrote it, pictures found or not
             tip = menu_rich(tip, self.mgr.menu_image)
             # a description with pictures (Rational Inventory Icons' icon rows) is a tooltip on the setting,
-            # not in the card (Remos, 30 Oct: "I liked it better"); one in words shows in the card under the
+            # not in the card (30 Oct: "I liked it better"); one in words shows in the card under the
             # pointer, as the game does, not as a tooltip too. A mod whose descriptions are all pictures
             # has no card
             pictures = raw_pictures
@@ -22647,7 +22991,7 @@ class MenuSettingsDialog(RememberingDialog):
                 slot.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
             else:
                 # a switch or a dropdown takes only its own width, so the name has the rest of the row and
-                # wraps only when it truly runs out of room (Remos, 30 Oct: it wrapped with half the row free)
+                # wraps only when it truly runs out of room (30 Oct: it wrapped with half the row free)
                 slot.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
             label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
             h.addWidget(slot)
@@ -22744,7 +23088,7 @@ class MenuSettingsDialog(RememberingDialog):
     def _fit_lists(self):
         """Every dropdown field as wide as the longest choice any of them has (so the same width
         all through the window, lined up at the rows' right end), within LIST_W: a few short
-        choices get a short field, not one that runs half the row (Remos, 30 Oct). A choice longer
+        choices get a short field, not one that runs half the row (30 Oct). A choice longer
         than the widest field is cut short in the field only; its open list shows it whole."""
         combos = [c for _p, _i, c, _v, _l in self.rows if isinstance(c, QComboBox)]
         if not combos:
@@ -22893,7 +23237,7 @@ class MenuSettingsDialog(RememberingDialog):
 
     def _hover_gone(self):
         """The pointer left a setting: unless it's on another one now, the card goes back to the page's
-        own text, or blank (Remos, 30 Oct: it stayed on the last setting pointed at)."""
+        own text, or blank (30 Oct: it stayed on the last setting pointed at)."""
         w = QApplication.widgetAt(QCursor.pos())
         while w is not None and w is not self:
             if w.property("menu_tip") is not None or w is self.info_box:
@@ -22915,7 +23259,7 @@ class MenuSettingsDialog(RememberingDialog):
     def _fit_info(self):
         """The description card's height for the page shown: what most of its texts need (and its
         own text), at least two lines. It grows for a longer one and doesn't shrink back while the
-        page stays, so moving from one setting to the next never makes it jump (Remos, 30 Oct: the
+        page stays, so moving from one setting to the next never makes it jump (30 Oct: the
         other ways tried, a card that follows its text or one that scrolls, were worse)."""
         i = self.pages.currentRow() if hasattr(self, "pages") else -1
         if not 0 <= i < len(self.model["pages"]) or not self.info_box.isVisibleTo(self):
@@ -25109,7 +25453,9 @@ class DownloadRow(QFrame):
                                     else "Muted" if action == "Reinstall" else "Primary")
         self.btn_main.style().unpolish(self.btn_main)
         self.btn_main.style().polish(self.btn_main)
-        self.btn_main.setToolTip(tip)
+        retry_off = self.state == "failed" and not self.panel.nexus_ok()
+        self.btn_main.setEnabled(not retry_off)
+        self.btn_main.setToolTip(nexus_downloads_tip() if retry_off else tip)
         self.action = action if self.state == "done" else ""
         self.btn_remove.setVisible(not self.running())
         self.btn_trash.setVisible(getattr(self, "_nested", False) and not self.running()
@@ -25236,6 +25582,7 @@ class DownloadsPanel(QWidget):
     BAR_EDGE = 4          # between the scrollbar and the panel's right edge
     BAR_GAP = 10          # between the cards and the scrollbar
     SLACK = 6             # kept spare beyond what the cards need, so nothing ever touches the edge
+    OFF_TEXT = "Mods you install from your own files show here."
     EMPTY_TEXT = ("Click “Mod Manager Download” on a mod's Nexus page. It downloads here, then the "
                   "Install window opens.")
 
@@ -25409,14 +25756,14 @@ class DownloadsPanel(QWidget):
             save_config(cfg)
 
     def refresh_visible(self):
-        self.setVisible(self._open and bool(self.main.cfg.get("nexus_key")))
+        self.setVisible(self._open)
         if hasattr(self.main, "search"):         # the filter box says what it filters
             self.main.search.setPlaceholderText("Filter mods and downloads" if self.isVisibleTo(self.main)
                                                 else "Filter mods")
 
     def set_open(self, on, remember=True):
         was = self._open
-        resize = remember and on != was and bool(self.main.cfg.get("nexus_key"))
+        resize = remember and on != was
         if was and not on and self.isVisible():
             self._save_width.stop()
             self._store_width()                                        # as it was when you closed it
@@ -25862,9 +26209,25 @@ class DownloadsPanel(QWidget):
             self.empty.setText(f"No downloads match “{self.query}”.")
             self.empty.show()
         else:
-            self.empty.setText(self.EMPTY_TEXT)
-            self.empty.setVisible(not self.rows)
+            self.refresh_empty()
         self._hits = hits
+
+    def nexus_ok(self):
+        """Can Nexus downloads come in (a login, or a personal key in a testing build)?"""
+        return nexus_on(self.main.cfg) and bool(self.api_key())
+
+    def refresh_empty(self):
+        """The empty panel's text: how downloads get here, or, with no Nexus login, that the mods
+        you install from your own files do (its tooltip says what turns Nexus downloads on)."""
+        if self.query and self.rows:
+            return
+        on = self.nexus_ok()
+        self.empty.setText(self.EMPTY_TEXT if on else self.OFF_TEXT)
+        self.empty.setToolTip("" if on else nexus_downloads_tip())
+        self.empty.setVisible(not self.rows)
+        for row in self.rows:
+            if row.state == "failed":
+                row._show(keep_status=True)             # its Retry: on or off with the login
 
     def update_summary(self):
         """How many mods the list holds and what their downloaded files take on disk."""
@@ -25980,7 +26343,7 @@ class MainWindow(RememberSize, QMainWindow):
         self.search.setFixedWidth(230)
         self.search.addAction(theme_icon("edit-find", "search"), QLineEdit.ActionPosition.LeadingPosition)
         self.search.textChanged.connect(self.apply_filter)
-        if self.downloads._open and self.cfg.get("nexus_key"):
+        if self.downloads._open:
             self.search.setPlaceholderText("Filter mods and downloads")
         head.addWidget(self.search, 0, Qt.AlignmentFlag.AlignVCenter)
 
@@ -25995,7 +26358,7 @@ class MainWindow(RememberSize, QMainWindow):
                        self.add_separator)
         self.act_check = more.addAction(theme_icon("view-refresh", "system-software-update"),
                                         "Check Nexus for updates", self.check_updates)
-        self.act_check.setVisible(nexus_on(self.cfg))
+        self.act_check.setVisible(True)                 # with a login or without (GraphQL)
         self.act_resolve = more.addAction(theme_icon("merge", "document-edit"), "Script decisions…",
                                           lambda: self.open_resolver())
         self.act_remerge = more.addAction(theme_icon("view-refresh", "merge"), "Merge again", self.merge_again)
@@ -26252,7 +26615,7 @@ class MainWindow(RememberSize, QMainWindow):
         global _code_font
         _code_font = None                              # the code font may have changed
         self.act_merger.setVisible(merger_ok(self.cfg.get("merger_path")))
-        self.act_check.setVisible(nexus_on(self.cfg))
+        self.act_check.setVisible(True)                 # with a login or without (GraphQL)
         self.load_manager()
         if self.cfg.get("nexus_key", "") != key_before and not NEXUS_CLIENT_ID:
             self.poll_limits()                         # a newly pasted key: checked once, right away
@@ -26304,7 +26667,7 @@ class MainWindow(RememberSize, QMainWindow):
             else:
                 self.status.say("Not a Witcher 3 link, skipped")
             return
-        if not self.cfg.get("nexus_key"):
+        if not (nexus_on(self.cfg) and self.cfg.get("nexus_key")):
             self.status.say(*nexus_login_needed())
             return
         if not self.mgr:
@@ -26392,10 +26755,13 @@ class MainWindow(RememberSize, QMainWindow):
         self.resize(target.size())
 
     def _update_nxm(self):
-        """Take nxm:// links while the app is open and has an API key — and only then."""
-        on = bool(self.cfg.get("nexus_key"))
+        """Take nxm:// links while the app is open and has a Nexus login (or a personal key in a
+        testing build), and only then. The downloads panel is there either way: it also holds
+        the archives you installed from your own files."""
+        on = nexus_on(self.cfg) and bool(self.cfg.get("nexus_key"))
         self.downloads.refresh_visible()
-        self.downloads.button.setVisible(on)
+        self.downloads.button.setVisible(True)
+        self.downloads.refresh_empty()
         try:
             if on and self._links.isListening():
                 self.nxm.register()
@@ -27678,7 +28044,7 @@ class MainWindow(RememberSize, QMainWindow):
                 menu.addAction("Clear my decisions…", lambda: self.clear_decisions(mid))
         menu.addSeparator()
         with_id = {c["id"] for c in chosen if c.get("nexus")}
-        if with_id and nexus_on(self.cfg):
+        if with_id:
             menu.addAction("Check for update" if len(with_id) == 1 else f"Check {len(with_id)} for updates",
                            lambda: self.check_updates(only=with_id, force=True))
         # skip the update Nexus has now; a newer one after it shows again
@@ -28125,19 +28491,9 @@ class MainWindow(RememberSize, QMainWindow):
         worker.start()
 
     def check_updates(self, only=None, force=False):
-        key = self.cfg.get("nexus_key", "").strip()
-        if not key:
-            if not NEXUS_CLIENT_ID:
-                return                                   # no Nexus login in this version: nothing to ask
-            box = QMessageBox(QMessageBox.Icon.Information, "Nexus login needed",
-                              "Checking for updates needs you to log in to Nexus (a free account is "
-                              "enough).\n\nLog in from Settings.", parent=self)
-            box.addButton("Settings…", QMessageBox.ButtonRole.ActionRole)
-            box.addButton(QMessageBox.StandardButton.Cancel)
-            box.exec()
-            if box.clickedButton().text().startswith("Settings"):
-                self.setup()
-            return
+        # with a login (or a personal key in a testing build): Nexus's API as always; without one,
+        # its public GraphQL API (no key needed)
+        key = self.cfg.get("nexus_key", "").strip() if nexus_on(self.cfg) else ""
         pool = [m for m in self.mgr.mods if only is None or m["id"] in only]
         without = [m for m in pool if not m.get("nexus")]
         worker_args = (key, None, only, force)
@@ -28185,6 +28541,10 @@ class MainWindow(RememberSize, QMainWindow):
         if res.get("offline"):
             bits.append(f"Nexus stopped answering, {left} left" if left else "Nexus stopped answering")
             notes.append(f"{res['offline']} The check stopped, keeping what it found. Try again later for the rest.")
+        elif res["capped"] and res.get("public"):
+            bits.append(f"{left} left")
+            notes.append(f"Stopped after {GQL_BUDGET} requests to Nexus, to go easy on it. Check again for the rest: "
+                         "the mods checked longest ago go first.")
         elif res["capped"]:
             bits.append(f"{left} left (hourly limit)")
             notes.append("Paused at the Nexus hourly limit. Try again later.")
